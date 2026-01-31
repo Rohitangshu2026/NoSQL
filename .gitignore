@@ -1,0 +1,12 @@
+# Maven build artifacts
+target/
+
+# macOS
+.DS_Store
+
+# IntelliJ
+.idea/
+*.iml
+
+# script
+scripts.sql
