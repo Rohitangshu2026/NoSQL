@@ -18,11 +18,37 @@ public class FragmentClient {
     }
 
     /**
-     * TODO: Initialize JDBC connections to all N Fragments.
+     * setupConnections
+     * ----------------
+     * Initializes JDBC connections to all database fragments.
+     *
+     * Behaviour:
+     *   - Creates one JDBC connection per fragment
+     *   - Stores each connection in connectionPool using fragment as key
+     *   - Databases are named fragment0, fragment1, ..., fragmentN-1
+     *
+     * Errors:
+     *   - Terminates execution if any fragment connection fails
      */
     public void setupConnections() {
-		
-	
+		try{
+            String host = "localhost";
+            String port = "5432";
+            String user = "rohit2026";
+            String password = "";
+
+            for(int fragment = 0; fragment < numFragments; ++fragment){
+                String databaseName = "fragment" + fragment;
+                String url = "jdbc:postgresql://" + host + ":" + port + "/" + databaseName;
+                Connection connection = DriverManager.getConnection(url,user,password);
+                connectionPool.put(fragment, connection);
+
+                System.out.println("Connection established to fragment: " + fragment);
+            }
+        }
+        catch(SQLException e){
+            throw new RuntimeException("Failed to connect to all fragments", e);
+        }
     }
 
     /**
