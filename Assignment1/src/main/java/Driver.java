@@ -21,7 +21,7 @@ public class Driver {
                 return;
             }
             Scanner scanner = new Scanner(in);
-            PrintWriter outputWriter = new PrintWriter("output.txt");
+            PrintWriter outputWriter = new PrintWriter("output/output.txt");
 
             System.out.println("Processing workload...");
             long startTime = System.currentTimeMillis();
