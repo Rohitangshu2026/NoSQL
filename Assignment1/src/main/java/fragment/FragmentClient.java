@@ -233,8 +233,7 @@ public class FragmentClient {
                 hasRows = true;
                 String department = rs.getString("department");
                 double avgScore = rs.getDouble("avg_score");
-
-                result.append(department + ":" + avgScore + ";");
+                result.append(String.format("%s:%.1f;", department, avgScore));
             }
 
             if(!hasRows)
