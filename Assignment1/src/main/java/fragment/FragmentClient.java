@@ -302,6 +302,16 @@ public class FragmentClient {
     }
 
     public void closeConnections() {
-        
+        for (Connection conn : connectionPool.values()) {
+            try {
+                if (conn != null && !conn.isClosed()) {
+                    conn.close();
+                    System.out.println("Closed connection to baseline database");
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
+        }
     }
+
 }
