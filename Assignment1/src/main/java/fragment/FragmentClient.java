@@ -149,35 +149,76 @@ public class FragmentClient {
     /**
      * deleteStudentFromCourse
      * -----------------------
-     * Deletes a specific course enrollment for a student
-     * from the baseline database.
+     * Deletes a specific course enrollment for a student.
      *
      * Parameters:
      *   studentId - unique student identifier
      *   courseId  - course identifier
      *
      * Behaviour:
+     *   - Routes the request using the studentId
      *   - Executes a DELETE on the Grade table
      *   - Removes only the specified (student_id, course_id) pair
      *   - Does not delete the student record itself
-     *   - Operates only on the baseline database (fragment 0)
+     * Errors:
+     *   - Prints stack trace if deletion fails
      */
     public void deleteStudentFromCourse(String studentId, String courseId) {
-        try{
-			// Your code here:
+        try {
+            String sql = "DELETE FROM Grade WHERE student_id = ? AND course_id = ?";
+            int shard = router.getFragmentId(studentId);
+
+            Connection conn = connectionPool.get(shard);
+            
+            PreparedStatement stmt =  conn.prepareStatement(sql);
+            stmt.setString(1, studentId);
+            stmt.setString(2, courseId);
+
+            stmt.executeUpdate();
+            stmt.close();
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
     /**
-     * TODO: Fetch the student's name and email.
+     * getStudentProfile
+     * -----------------
+     * Retrieves the profile information for a student.
+     *
+     * Parameters:
+     *   studentId - unique student identifier
+     *
+     * Behaviour:
+     *   - Routes the request using the studentId
+     *   - Executes a SELECT query on the Student table
+     *   - Fetches the student's name and email
+     *   - Returns the result in the format: "name,email"
+     *
+     * Errors:
+     *   - Prints stack trace if retrieval fails
+     *   - Returns "ERROR" if an exception occurs
      */
     public String getStudentProfile(String studentId) {
         try {
-            // Your code here
-            return null;
+            String sql = "SELECT name, email FROM Student WHERE student_id = ?";
+            int shard = router.getFragmentId(studentId);
 
+            Connection conn = connectionPool.get(shard);
+
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            stmt.setString(1, studentId);
+
+            ResultSet rs = stmt.executeQuery();
+            
+            String result = null;
+
+            if (rs.next())
+                result = rs.getString("name") + "," + rs.getString("email");
+            
+            rs.close();
+            stmt.close();
+            return result;
         } catch (Exception e) {
             e.printStackTrace();
             return "ERROR";
@@ -358,8 +399,32 @@ public class FragmentClient {
         }
     }
 
-
+    /**
+     * closeConnections
+     * ----------------
+     * Closes all active JDBC connections to the database fragments.
+     *
+     * Behaviour:
+     *   - Iterates over all fragment connections stored in connectionPool
+     *   - Closes each open JDBC connection
+     *   - Clears the connectionPool after closing all connections
+     *
+     * Errors:
+     *   - Terminates execution if any fragment connection fails to close
+     */
     public void closeConnections() {
+        try {
+            for (int fragment = 0; fragment < numFragments; ++fragment) {
+                Connection conn = connectionPool.get(fragment);
+                if (conn != null && !conn.isClosed()) {
+                    conn.close();
+                }
 
+                System.out.println("Connection closed to fragment: " + fragment);
+            } 
+            connectionPool.clear();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to close all fragments", e);
+        }
     }
 }
