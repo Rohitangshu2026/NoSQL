@@ -177,18 +177,107 @@ public class FragmentClient {
     }
 
     /**
-     * TODO: Find all the students that have taken most number of courses
+     * getAllStudentsWithMostCourses
+     * -----------------------------
+     * Finds all students who are enrolled in the maximum number of courses
+     * across all database fragments.
+     *
+     * Behaviour:
+     *   - Identifies students having the maximum course count
+     *     within a fragment
+     *   - Collects local results from each fragment
+     *   - Computes the global maximum course count
+     *   - Filters students whose course count equals the global maximum
+     *   - Sorts the final result by student_id for deterministic output
+     *
+     * Output Format:
+     *   "student_id,name;student_id,name"
+     *
+     * Notes:
+     *   - Uses student_id-based horizontal partitioning
+     *   - Each student exists in exactly one fragment
+     *   - Avoids cross-fragment joins by using a two-phase aggregation strategy
+     *
+     * Returns:
+     *   - A formatted string of students with the highest course enrollment
+     *   - null if no enrollments exist
+     *   - "ERROR" if an exception occurs
      */
+
+
     public String getAllStudentsWithMostCourses() {
+        class StudentInfo{
+            String studentId;
+            String name;
+            int courseCount;
+
+            StudentInfo(String studentId, String name, int courseCount){
+                this.studentId = studentId;
+                this.name = name;
+                this.courseCount = courseCount;
+            }
+        }
+
+        List<StudentInfo> localMaxResult = new ArrayList<>();
+
+        String sql = "SELECT s.student_id, s.name, COUNT(g.course_id) AS cnt " +
+                "FROM student as s JOIN grade as g ON s.student_id = g.student_id " +
+                "GROUP BY s.student_id,s.name " +
+                "HAVING COUNT(g.course_id) = ( " +
+                "   SELECT MAX(course_count) FROM ( " +
+                "       SELECT COUNT(course_id) AS course_count " +
+                "       FROM grade " +
+                "       GROUP BY student_id " +
+                "   ) AS course_counts " +
+                "   )";
         try {
-            // Your code here
-            return null;
+            // get students with max course count from each fragment
+            for(int fragment = 0; fragment < numFragments; ++fragment){
+                Connection conn = connectionPool.get(fragment);
+
+                try(PreparedStatement statement = conn.prepareStatement(sql);
+                    ResultSet rs = statement.executeQuery()){
+                    while(rs.next()){
+                        localMaxResult.add(new StudentInfo(rs.getString("student_id"), rs.getString("name"), rs.getInt("cnt")));
+                    }
+                }
+            }
+
+            if(localMaxResult.isEmpty())
+                return null;
+
+            // get students with max course count from all fragments
+            int globalMax = 0;
+            for(StudentInfo student : localMaxResult){
+                globalMax = Math.max(globalMax, student.courseCount);
+            }
+
+            List<StudentInfo> globalMaxResult = new ArrayList<>();
+            for(StudentInfo student: localMaxResult){
+                if(student.courseCount == globalMax)
+                    globalMaxResult.add(student);
+            }
+
+            // order the students for deterministic output
+            globalMaxResult.sort(Comparator.comparing(a -> a.studentId));
+
+            StringBuilder result = new StringBuilder();
+            for (StudentInfo s : globalMaxResult) {
+                result.append(s.studentId)
+                        .append(",")
+                        .append(s.name)
+                        .append(";");
+            }
+
+            result.setLength(result.length() - 1);
+            return result.toString();
 
         } catch (Exception e) {
             e.printStackTrace();
             return "ERROR";
         }
     }
+
 
     public void closeConnections() {
 
