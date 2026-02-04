@@ -52,39 +52,119 @@ public class FragmentClient {
     }
 
     /**
-     * TODO: Route the student to the correct shard and execute the INSERT.
+     * insertGrade
+     * -----------
+     * Inserts a grade record into the baseline database.
+     *
+     * Parameters:
+     *   studentId - unique student identifier
+     *   courseId  - course identifier
+     *   score     - numeric score obtained by the student
+     *
+     * Behaviour:
+     *   - Executes an INSERT on the Grade table
+     *   - Operates only on the baseline database (fragment 0)
+     *
+     * Errors:
+     *   - Prints stack trace if insertion fails
      */
     public void insertStudent(String studentId, String name, int age, String email) {
-        try {
-            // Your code here:
+        String sql = "INSERT INTO Student (student_id, name, age, email) VALUES (?, ?, ?, ?)";
+        int shard = router.getFragmentId(studentId);
 
+        try(PreparedStatement stmt = connectionPool.get(shard).prepareStatement(sql)){
+            stmt.setString(1, studentId);
+            stmt.setString(2, name);
+            stmt.setInt(3, age);
+            stmt.setString(4, email);
+            stmt.executeUpdate();
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
     /**
-     * TODO: Route the grade to the correct shard and execute the INSERT.
+     * insertGrade
+     * -----------
+     * Inserts a grade record into the baseline database.
+     *
+     * Parameters:
+     *   studentId - unique student identifier
+     *   courseId  - course identifier
+     *   score     - numeric score obtained by the student
+     *
+     * Behaviour:
+     *   - Executes an INSERT on the Grade table
+     *   - Operates only on the baseline database (fragment 0)
+     *
+     * Errors:
+     *   - Prints stack trace if insertion fails
      */
     public void insertGrade(String studentId, String courseId, int score) {
-        try {
-            // Your code here
+        String sql = "INSERT INTO Grade (student_id, course_id, score) VALUES (?, ?, ?)" +
+                "ON CONFLICT (student_id, course_id) DO NOTHING";
+        int shard = router.getFragmentId(studentId);
 
+        try(PreparedStatement stmt =  connectionPool.get(shard).prepareStatement(sql)){
+            stmt.setString(1, studentId);
+            stmt.setString(2, courseId);
+            stmt.setInt(3, score);
+            stmt.executeUpdate();
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
+
+    /**
+     * updateGrade
+     * -----------
+     * Updates the score for an existing student-course entry
+     * in the baseline database.
+     *
+     * Parameters:
+     *   studentId - student identifier
+     *   courseId  - course identifier
+     *   newScore  - updated score
+     *
+     * Behaviour:
+     *   - Executes an UPDATE on the Grade table
+     *   - Operates only on the baseline database (fragment 0)
+     * Errors:
+     *   - Prints stack trace if insertion fails
+     */
     public void updateGrade(String studentId, String courseId, int newScore) {
-        try {
-		// Your code here:
+        String sql = "UPDATE Grade SET score = ? WHERE student_id = ? AND course_id = ?";
+        int shard = router.getFragmentId(studentId);
+
+        try(PreparedStatement stmt =  connectionPool.get(shard).prepareStatement(sql)){
+            stmt.setInt(1, newScore);
+            stmt.setString(2, studentId);
+            stmt.setString(3, courseId);
+            stmt.executeUpdate();
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
+    /**
+     * deleteStudentFromCourse
+     * -----------------------
+     * Deletes a specific course enrollment for a student
+     * from the baseline database.
+     *
+     * Parameters:
+     *   studentId - unique student identifier
+     *   courseId  - course identifier
+     *
+     * Behaviour:
+     *   - Executes a DELETE on the Grade table
+     *   - Removes only the specified (student_id, course_id) pair
+     *   - Does not delete the student record itself
+     *   - Operates only on the baseline database (fragment 0)
+     */
     public void deleteStudentFromCourse(String studentId, String courseId) {
-        try {
-	// Your code here:
+        try{
+			// Your code here:
         } catch (Exception e) {
             e.printStackTrace();
         }
