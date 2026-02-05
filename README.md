@@ -119,6 +119,7 @@ Assignment1/
 ├── output/
 │   ├── output.txt
 │   └── expected_output.txt
+├── report.pdf
 └── pom.xml
 ```
 ---
