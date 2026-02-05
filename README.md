@@ -1,12 +1,12 @@
 # Assignment 1 
-## SimuFragDB – Simulated Distributed RDBMS
+## SimuFragDB – Simulating a Distributed RDBMS
 
 ---
 
 ### Overview
 
 **SimuFragDB** is a simulated distributed relational database system built on top of PostgreSQL.
-It emulates a multi-node distributed database by running multiple PostgreSQL instances (fragments) on a single machine, each storing a horizontal partition of the data.
+It simulates a multi-node distributed database by running multiple PostgreSQL instances (fragments) on a single machine, each storing a horizontal partition of the data.
 
 The system demonstrates:
 - Horizontal fragmentation
@@ -14,7 +14,7 @@ The system demonstrates:
 - Fragment-local execution
 - Application-level aggregation across fragments
 
-This project focuses on understanding distributed database concepts, not on strict consistency or fault tolerance.
+This assignment focuses on understanding distributed database concepts, not on strict consistency or fault tolerance.
 
 ---
 
@@ -24,7 +24,7 @@ This project focuses on understanding distributed database concepts, not on stri
 - baseline- Single PostgreSQL database used to generate `expected_output.txt`
 - fragment0, fragment1, fragment2 – Horizontally partitioned shards
 
-Each fragment is a separate PostgreSQL database:
+Each fragment is a separate PostgreSQL database
 #### Partitioning Strategy
 - Data is horizontally partitioned using a deterministic hash function:
   - fragmentId = abs(key.hashCode()) % numFragments
@@ -37,8 +37,35 @@ Queries are explicitly routed to fragments via Router.java.
 
 ---
 
-### Database Schema
 
+### PostgreSQL Database Setup
+
+
+```bash
+psql -U <your_username> postgres
+```
+
+Create the baseline database:
+
+```sql
+CREATE DATABASE baseline;
+```
+
+Create fragment databases:
+
+```sql
+CREATE DATABASE fragment0;
+CREATE DATABASE fragment1;
+CREATE DATABASE fragment2;
+```
+
+Exit PostgreSQL:
+```sql
+\q
+```
+---
+
+### Database Schema
 The following schema is created on every fragment using `scripts.sql`:
 ```SQL
 CREATE TABLE Student (
@@ -65,35 +92,46 @@ department VARCHAR(50)
 
 The Course table is replicated on all fragments.
 
+```SQL
+INSERT INTO Course (course_id, course_name, department) VALUES
+('CS101', 'Intro to NoSQL', 'CS'),
+('CS102', 'Operating Systems', 'CS'),
+('MA101', 'Calculus I', 'Math'),
+('MA102', 'Linear Algebra', 'Math'),
+('PH101', 'Physics I', 'Physics');
+```
+
 ---
 
 ### Project Structure
 
 ```
 Assignment1/
-├── src/main/java/
-│   ├── Driver.java
-│   └── fragment/
-│       ├── FragmentClient.java
-│       └── Router.java
+├── src/
+│   ├── main/
+│   │    └── java/
+│   │         ├── Driver.java
+│   │         └── fragment/
+│   │             ├── FragmentClient.java
+│   │             └── Router.java
+│   └── resources
+│        └── workload.txt   
 ├── output/
 │   ├── output.txt
 │   └── expected_output.txt
-├── scripts.sql
-├── pom.xml
-└── README.md
+└── pom.xml
 ```
 ---
 ### Key Components
 `Router`
 
-- Determines fragment ID using student_id
+- Determines fragment ID using `student_id`
 
 - Ensures consistent routing for inserts, updates, and deletes
 
 `FragmentClient`
 
-- Handles all database operations:
+ Handles all database operations:
 
 - Connection setup for all fragments
 
@@ -105,11 +143,11 @@ Assignment1/
 
 `Driver`
 
-- Reads commands from workload.txt
+- Reads commands from `workload.txt`
 
 - Executes operations sequentially
 
-- Writes query results to output/output.txt
+- Writes query results to `output.txt`
 
 ---
 ### Supported Operations
@@ -142,7 +180,7 @@ Assignment1/
 
 ---
 
-#### Data Modification Operations (Routed)
+#### Data Modification Operations
 
 - `insertStudent(studentId, name, age, email)`:
 Routes the insert using studentId and inserts into the correct fragment.
@@ -162,9 +200,10 @@ Deletes a specific (student_id, course_id) entry from the correct fragment.
 
 - `getStudentProfile(studentId)`:
 Fetches student name and email from the routed fragment.
-Output format:
+ 
+   Output format:
 
-name,email
+        name,email
 
 ---
 
@@ -204,7 +243,7 @@ No cross-fragment joins are used.
 
 1. Each fragment finds students with the maximum course count locally.
 
-2. The coordinator determines the global maximum.
+2. The application code determines the global maximum.
 
 3. Students matching the global maximum are returned.
 
@@ -225,9 +264,9 @@ Results are sorted by `student_id` for deterministic output.
 
 - Outputs are written to:
 
-  - `output.txt` (distributed run)
+  - `output.txt` (distributed setting)
 
-  - `expected_output.txt` (baseline run)
+  - `expected_output.txt` (baseline setting)
 
 ---
 
