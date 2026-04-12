@@ -64,11 +64,18 @@ Processing:
 4. Each term is emitted at most once per document.
 5. Reducer sums counts to obtain DF.
 
+Additional preprocessing used:
+- remove tokens with digits
+- remove tokens shorter than 3 characters
+- remove common markup artifacts: apo, categori, extern, http, link, quot, refer
+- stopwords are checked both before and after stemming
+These filters are applied in the mapper before emitting terms.
+
 Run example on the small dataset:
-hadoop jar problem_2/jars/document_frequency.jar DocumentFrequency data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2a data/stopwords.txt
+hadoop jar problem_2/jars/document_frequency.jar data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2a data/stopwords.txt
 
 Run example on the full dataset:
-hadoop jar problem_2/jars/document_frequency.jar DocumentFrequency data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2a_full data/stopwords.txt
+hadoop jar problem_2/jars/document_frequency.jar data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2a_full data/stopwords.txt
 
 Output:
 problem_2/results/output_problem_2a/part-r-00000
@@ -98,11 +105,27 @@ Processing:
 3. Compute the score using the DF value from top100_df.tsv.
 4. Write the final TSV output.
 
+Additional preprocessing used:
+- remove tokens with digits
+- remove tokens shorter than 3 characters
+- remove common markup artifacts: apo, categori, extern, http, link, quot, refer
+- stopwords are checked both before and after stemming
+These filters are applied in the mapper before emitting terms.
+
+Screenshots
+Save runtime/output screenshots under:
+problem_2/results/screenshots/
+
+Measured runtimes (full dataset)
+Run with Linux-native dataset and conservative local-mode settings:
+- Problem 2(a): real 4m19.412s
+- Problem 2(b): real 4m6.313s
+
 Run example on the small dataset:
-hadoop jar problem_2/jars/tfidf_score.jar TfIdfScore data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2b data/stopwords.txt problem_2/results/top100_df.tsv
+hadoop jar problem_2/jars/tfidf_score.jar data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2b data/stopwords.txt problem_2/results/top100_df.tsv
 
 Run example on the full dataset:
-hadoop jar problem_2/jars/tfidf_score.jar TfIdfScore data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2b_full data/stopwords.txt problem_2/results/top100_df.tsv
+hadoop jar problem_2/jars/tfidf_score.jar data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2b_full data/stopwords.txt problem_2/results/top100_df.tsv
 
 Output:
 problem_2/results/output_problem_2b/part-r-00000
@@ -116,18 +139,39 @@ Suggested workflow for the full dataset
 4. Run Problem 2(b)
 5. Save runtime outputs and screenshots for the report
 
+Full dataset runs (recommended for WSL)
+For stability and speed, run the full dataset from Linux home storage and copy results back.
+
+Example:
+1) Extract to Linux home:
+tar -xf data/Wikipedia-EN-20120601_ARTICLES.tar.gz -C ~/assignment2-data/
+
+2) Run 2(a) in Linux home:
+hadoop jar problem_2/jars/document_frequency.jar ~/assignment2-data/Wikipedia-EN-20120601_ARTICLES ~/assignment2-problem2-full/output_problem_2a_full data/stopwords.txt
+
+3) Copy DF output into repo:
+cp ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000 problem_2/results/df_values.tsv
+sort -k2,2nr problem_2/results/df_values.tsv | head -100 > problem_2/results/top100_df.tsv
+
+4) Run 2(b) in Linux home:
+hadoop jar problem_2/jars/tfidf_score.jar ~/assignment2-data/Wikipedia-EN-20120601_ARTICLES ~/assignment2-problem2-full/output_problem_2b_full data/stopwords.txt problem_2/results/top100_df.tsv
+
+5) Copy TF-IDF output into repo:
+cp ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000 problem_2/results/tfidf_scores_full.tsv
+
 Useful commands
 Inspect DF output:
-head problem_2/results/output_problem_2a_full/part-r-00000
+head ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000
 
 Inspect final score output:
-head problem_2/results/output_problem_2b_full/part-r-00000
+head ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000
 
 Count output rows:
-wc -l problem_2/results/output_problem_2a_full/part-r-00000
-wc -l problem_2/results/output_problem_2b_full/part-r-00000
+wc -l ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000
+wc -l ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000
 
 Notes
 - Delete any previous Hadoop output directory before re-running a job.
 - Use the small dataset only for development/testing.
 - Use the full dataset for final experiments and screenshots.
+- The JARs include the main class; no class name is needed after `hadoop jar`.

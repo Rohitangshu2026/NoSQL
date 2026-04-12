@@ -21,7 +21,7 @@ Problem 2 is implemented as a two-stage Hadoop MapReduce pipeline:
 2. Problem 2(b): use the top 100 DF terms to compute per-document TF-based scores.
 
 The sample dataset `Wikipedia-50-ARTICLES.tar` is included for testing.
-Final experiments should be run on `Wikipedia-EN-20120601_ARTICLES.tar`, which is not committed due to size.
+Final experiments should be run on the full dataset, which is not committed due to size.
 
 ## Problem 2 Files
 
@@ -43,9 +43,30 @@ Supporting files:
 - `data/stopwords.txt`
 - `lib/opennlp-tools-1.9.3.jar`
 
+## Preprocessing Notes
+
+The following preprocessing steps are applied before counting:
+
+- lowercase tokens and strip leading/trailing apostrophes
+- drop tokens containing digits
+- drop tokens shorter than 3 characters
+- remove stopwords (checked before and after Porter stemming)
+- remove common markup artifacts: `apo`, `categori`, `extern`, `http`, `link`, `quot`, `refer`
+
+These filters are applied in the **Mapper** stage before emitting terms.
+
+## Screenshots
+
+Store runtime/output screenshots under:
+
+- `problem_2/results/screenshots/`
+
 ## Build Notes
 
 Problem 2 was developed and tested using Hadoop in WSL/Ubuntu.
+The jobs force conservative local-mode defaults in code:
+`mapreduce.local.map.tasks.maximum=1`, `mapreduce.task.io.sort.mb=32`,
+`mapreduce.map.java.opts=-Xmx256m`, `mapreduce.reduce.java.opts=-Xmx256m`.
 
 Before compiling, set:
 
@@ -92,10 +113,10 @@ Extract the sample dataset:
 tar -xf data/Wikipedia-50-ARTICLES.tar -C data/
 ```
 
-Run Problem 2(a):
+Run Problem 2(a) (small dataset):
 
 ```bash
-hadoop jar problem_2/jars/document_frequency.jar DocumentFrequency \
+hadoop jar problem_2/jars/document_frequency.jar \
   data/Wikipedia-50-ARTICLES \
   problem_2/results/output_problem_2a \
   data/stopwords.txt
@@ -107,10 +128,10 @@ Generate the top 100 DF terms:
 sort -k2,2nr problem_2/results/output_problem_2a/part-r-00000 | head -100 > problem_2/results/top100_df.tsv
 ```
 
-Run Problem 2(b):
+Run Problem 2(b) (small dataset):
 
 ```bash
-hadoop jar problem_2/jars/tfidf_score.jar TfIdfScore \
+hadoop jar problem_2/jars/tfidf_score.jar \
   data/Wikipedia-50-ARTICLES \
   problem_2/results/output_problem_2b \
   data/stopwords.txt \
@@ -122,12 +143,28 @@ hadoop jar problem_2/jars/tfidf_score.jar TfIdfScore \
 Current committed Problem 2 artifacts include:
 
 - `problem_2/results/df_values.tsv`
+- `problem_2/results/top100_df.tsv`
 - `problem_2/results/sample_outputs/tfidf_scores.tsv`
+- `problem_2/results/tfidf_scores_full.tsv`
 
 Additional full-run outputs can be generated into:
 
-- `problem_2/results/output_problem_2a_full/`
-- `problem_2/results/output_problem_2b_full/`
+- `~/assignment2-problem2-full/output_problem_2a_full/`
+- `~/assignment2-problem2-full/output_problem_2b_full/`
+
+Only the final `part-r-00000` files are copied into the repo:
+
+- `problem_2/results/df_values.tsv`
+- `problem_2/results/top100_df.tsv`
+- `problem_2/results/tfidf_scores_full.tsv`
+
+## Measured Runtimes (Full Dataset)
+
+Measured on WSL/Ubuntu with conservative local-mode settings and Linux-native input storage
+(`~/assignment2-data`):
+
+- Problem 2(a): `real 4m19.412s`
+- Problem 2(b): `real 4m6.313s`
 
 ## Notes
 

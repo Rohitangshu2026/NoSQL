@@ -17,6 +17,14 @@ import opennlp.tools.stemmer.PorterStemmer;
 
 public class DocumentFrequency {
 
+	private static void applyLocalExecutionDefaults(Configuration conf) {
+		// Force conservative defaults for Hadoop local mode on a single machine.
+		conf.setInt("mapreduce.local.map.tasks.maximum", 1);
+		conf.setInt("mapreduce.task.io.sort.mb", 32);
+		conf.set("mapreduce.map.java.opts", "-Xmx256m");
+		conf.set("mapreduce.reduce.java.opts", "-Xmx256m");
+	}
+
 	public static class DocumentFrequencyMapper extends Mapper<Text, Text, Text, IntWritable> {
 
 		private static final IntWritable ONE = new IntWritable(1);
@@ -106,6 +114,12 @@ public class DocumentFrequency {
 		}
 
 		Configuration conf = new Configuration();
+		applyLocalExecutionDefaults(conf);
+		System.out.println("Local config: map.tasks.max="
+				+ conf.getInt("mapreduce.local.map.tasks.maximum", -1)
+				+ ", sort.mb=" + conf.getInt("mapreduce.task.io.sort.mb", -1)
+				+ ", map.opts=" + conf.get("mapreduce.map.java.opts")
+				+ ", reduce.opts=" + conf.get("mapreduce.reduce.java.opts"));
 		Job job = Job.getInstance(conf, "document-frequency");
 
 		job.setJarByClass(DocumentFrequency.class);
