@@ -171,3 +171,8 @@ Measured on WSL/Ubuntu with conservative local-mode settings and Linux-native in
 - Use the small dataset only for development/testing.
 - Use the full Wikipedia dataset for final experiments and screenshots.
 - Detailed step-by-step instructions for Problem 2 are in `problem_2/problem_2.txt`.
+
+## Optional Full Verification
+
+If you want a full correctness check of every TF‑IDF score, use the verifier:
+`problem_2/src/VerifyTfIdf.java`. Instructions are included in `problem_2/problem_2.txt`.

@@ -175,3 +175,17 @@ Notes
 - Use the small dataset only for development/testing.
 - Use the full dataset for final experiments and screenshots.
 - The JARs include the main class; no class name is needed after `hadoop jar`.
+
+Full correctness verification (optional)
+To fully verify every output score against the dataset and top-100 DF list, use:
+
+Compile:
+cd problem_2
+javac -cp ".:/mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/lib/opennlp-tools-1.9.3.jar" src/VerifyTfIdf.java src/TextProcessingUtils.java
+
+Run:
+java -cp ".:/mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/lib/opennlp-tools-1.9.3.jar:src" VerifyTfIdf \
+  /home/jack/assignment2-data/Wikipedia-EN-20120601_ARTICLES \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/results/top100_df.tsv \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/results/tfidf_scores_full.tsv \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/data/stopwords.txt

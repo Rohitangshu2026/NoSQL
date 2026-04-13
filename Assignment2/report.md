@@ -2,35 +2,22 @@
 
 ## Problem 2: Indexing Documents via Hadoop
 
-### Program Logic
+### Document Frequency Computation
 
-**Part (a): Document Frequency (DF)**  
+**Mapper**  
 Each Wikipedia article is treated as one document. The mapper tokenizes the document,
 applies preprocessing (lowercasing, stopword filtering, stemming, etc.), and emits each
-distinct term once per document. The reducer sums these counts to obtain the number of
-documents in which each term appears (DF).
+distinct term once per document.
 
 Output format:
 ```
 TERM<TAB>DF
 ```
 
-**Part (b): TF‑Score per Document**  
-The top 100 DF terms from Part (a) are loaded from `top100_df.tsv` via Hadoop distributed
-cache. For each document, the mapper builds a small in‑memory map (stripe) of term
-frequencies (TF) for only those 100 terms. Each term’s TF is combined with its DF to
-compute:
+**Reducer**  
+The reducer sums counts to obtain the number of documents in which each term appears (DF).
 
-SCORE = TF × log(10000/DF + 1)
-
-Output format:
-```
-ID<TAB>TERM<TAB>SCORE
-```
-
-### Pseudocode
-
-**Part (a)**
+**Pseudocode (Mapper/Reducer)**
 ```
 Mapper(docId, docText):
     terms = empty set
@@ -46,7 +33,27 @@ Reducer(term, counts):
     emit(term, DF)
 ```
 
-**Part (b)**
+### TF‑IDF Computation
+
+**Setup**  
+The top 100 DF terms from Part (a) are loaded from `top100_df.tsv` via Hadoop distributed
+cache. Each term’s TF is combined with its DF to compute:
+
+SCORE = TF × log(10000/DF + 1)
+
+Output format:
+```
+ID<TAB>TERM<TAB>SCORE
+```
+
+**Mapper**  
+For each document, the mapper builds a small in‑memory map (stripe) of term
+frequencies (TF) for only those 100 terms, then emits the computed score.
+
+**Reducer**  
+Passthrough reducer (emits the mapper output).
+
+**Pseudocode (Mapper/Reducer)**
 ```
 Mapper(docId, docText):
     tf = empty map
@@ -89,3 +96,12 @@ Here are the screenshots of successful full runs and runtimes:
 ### Additional Notes
 - The full dataset `Wikipedia-EN-20120601_ARTICLES.tar.gz` was used for final experiments.
 - Sample outputs and full result files are included in `problem_2/results/`.
+
+### Verification (Optional)
+An optional full‑correctness verifier is available in `problem_2/src/VerifyTfIdf.java`.
+It recomputes every TF‑IDF score from the dataset and compares it against
+`problem_2/results/tfidf_scores_full.tsv`. Compile/run commands are documented in
+`problem_2/problem_2.txt`.
+
+#### Verification Screenshot
+![Problem 2(b) full verification screenshot](problem_2/results/screenshots/NoSQL%20A2%20P2B%20Validation.png)

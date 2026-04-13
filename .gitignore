@@ -9,6 +9,9 @@ target/
 .vscode/
 *.iml
 
+# Java build artifacts
+*.class
+
 # Database
 scripts.sql
 
