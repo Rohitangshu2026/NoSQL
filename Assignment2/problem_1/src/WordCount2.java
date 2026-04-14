@@ -75,8 +75,9 @@ public class WordCount2 extends Configured implements Tool {
             line = line.replaceAll("<[^>]+>", "");
             line = line.replaceAll("(https?://|www\\.)\\S+", "");
             line = line.replaceAll("\\[\\[[^\\]]+\\]\\]", "");
-            String[] tokens = line.split("[^a-zA-Z]+");
+            String[] tokens = line.split("[^\\w']+");
             for (String token : tokens) {
+                token = token.toLowerCase();
                 if (token.isEmpty())
                     continue;
                 if (token.length() < 2)

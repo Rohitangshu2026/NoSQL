@@ -75,11 +75,12 @@ public class PairsFunctionLevelAggregation extends Configured implements Tool {
             line = line.replaceAll("<[^>]+>", "");
             line = line.replaceAll("(https?://|www\\.)\\S+", "");
             line = line.replaceAll("\\[\\[[^\\]]+\\]\\]", "");
-            String[] tokens = line.split("[^a-zA-Z]+");
+            String[] tokens = line.split("[^\\w']+");
 
             // Build dense list of ALL valid tokens (not just top-50)
             List<String> validWords = new ArrayList<>();
             for (String token : tokens) {
+                token = token.toLowerCase();
                 if (token.isEmpty())
                     continue;
                 if (token.length() < 2)
