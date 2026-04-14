@@ -1,14 +1,5 @@
-# macOS
-.DS_Store
-
-# Maven
-target/
-
-# IDEs
-.idea/
-.vscode/
-*.iml
-
-# Database
-scripts.sql
-
+Assignment2/data/
+Assignment2/problem_1/results/
+*.log
+*.class
+*.jar
