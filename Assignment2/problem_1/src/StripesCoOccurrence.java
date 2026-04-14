@@ -79,7 +79,7 @@ public class StripesCoOccurrence extends Configured implements Tool {
             line = line.replaceAll("<[^>]+>", "");
             line = line.replaceAll("(https?://|www\\.)\\S+", "");
             line = line.replaceAll("\\[\\[[^\\]]+\\]\\]", "");
-            String[] tokens = line.split("[^\\\\w']+");
+            String[] tokens = line.split("[^a-zA-Z]+");
 
             // Build dense list of ALL valid tokens (not just top-50)
             java.util.List<String> validWords = new java.util.ArrayList<>();

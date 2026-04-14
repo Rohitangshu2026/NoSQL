@@ -18,7 +18,8 @@ import java.net.URI;
 import java.util.*;
 
 /**
- * A MapReduce job to generate the co-occurring word matrix using the Pairs approach
+ * A MapReduce job to generate the co-occurring word matrix using the Pairs
+ * approach
  * with class-level local aggregation.
  */
 public class PairsClassLevelAggregation extends Configured implements Tool {
@@ -27,8 +28,10 @@ public class PairsClassLevelAggregation extends Configured implements Tool {
     // Mapper – in-mapper (map-CLASS-level) aggregation
     // -----------------------------------------------------------------------
     /**
-     * Maintains an in-memory aggregation buffer across the entire task (class-level)
-     * before emitting word pairs with their accumulated counts during the cleanup phase.
+     * Maintains an in-memory aggregation buffer across the entire task
+     * (class-level)
+     * before emitting word pairs with their accumulated counts during the cleanup
+     * phase.
      */
     public static class PairsClassMapper extends Mapper<Object, Text, Text, IntWritable> {
 
@@ -74,27 +77,32 @@ public class PairsClassLevelAggregation extends Configured implements Tool {
             line = line.replaceAll("<[^>]+>", "");
             line = line.replaceAll("(https?://|www\\.)\\S+", "");
             line = line.replaceAll("\\[\\[[^\\]]+\\]\\]", "");
-            String[] tokens = line.split("[^\\\\w']+");
+            String[] tokens = line.split("[^a-zA-Z]+");
 
             // Build dense list of ALL valid tokens (not just top-50)
             List<String> validWords = new ArrayList<>();
             for (String token : tokens) {
-                if (token.isEmpty()) continue;
-                if (token.length() < 2) continue;
+                if (token.isEmpty())
+                    continue;
+                if (token.length() < 2)
+                    continue;
                 validWords.add(token);
             }
 
             for (int i = 0; i < validWords.size(); i++) {
                 String center = validWords.get(i);
-                if (!topWords.contains(center)) continue;
+                if (!topWords.contains(center))
+                    continue;
 
                 int start = Math.max(0, i - distance);
                 int end = Math.min(validWords.size() - 1, i + distance);
 
                 for (int j = start; j <= end; j++) {
-                    if (j == i) continue;
+                    if (j == i)
+                        continue;
                     String neighbor = validWords.get(j);
-                    if (!topWords.contains(neighbor)) continue;
+                    if (!topWords.contains(neighbor))
+                        continue;
 
                     String pairKey = "(" + center + "," + neighbor + ")";
                     localCounts.merge(pairKey, 1, Integer::sum);
@@ -125,7 +133,8 @@ public class PairsClassLevelAggregation extends Configured implements Tool {
     // Reducer – standard sum
     // -----------------------------------------------------------------------
     /**
-     * Aggregates the counts for each word pair to compute the final co-occurrence frequency.
+     * Aggregates the counts for each word pair to compute the final co-occurrence
+     * frequency.
      */
     public static class PairsSumReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
         private IntWritable result = new IntWritable();

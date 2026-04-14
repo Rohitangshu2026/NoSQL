@@ -31,7 +31,7 @@ html_entity_re = re.compile(r"&[a-z]+;")
 html_tag_re = re.compile(r"<[^>]+>")
 url_re = re.compile(r"(https?://|www\.)\S+")
 wiki_link_re = re.compile(r"\[\[[^\]]+\]\]")
-split_re = re.compile(r"[^\w']+")
+split_re = re.compile(r"[^a-zA-Z]+")
 
 def tokenize(line):
     line = line.lower()

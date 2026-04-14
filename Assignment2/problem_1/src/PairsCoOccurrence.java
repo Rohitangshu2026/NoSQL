@@ -16,12 +16,14 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.fs.Path;
 
 /**
- * A MapReduce job to generate the co-occurring word matrix using the Pairs approach,
+ * A MapReduce job to generate the co-occurring word matrix using the Pairs
+ * approach,
  * without any explicit local aggregation.
  */
 public class PairsCoOccurrence extends Configured implements Tool {
     /**
-     * Emits a pair of words and a count of one for each co-occurrence within the specified contextual distance.
+     * Emits a pair of words and a count of one for each co-occurrence within the
+     * specified contextual distance.
      */
     public static class PairMapper extends Mapper<Object, Text, Text, IntWritable> {
         private final static IntWritable one = new IntWritable(1);
@@ -55,13 +57,15 @@ public class PairsCoOccurrence extends Configured implements Tool {
             line = line.replaceAll("<[^>]+>", "");
             line = line.replaceAll("(https?://|www\\.)\\S+", "");
             line = line.replaceAll("\\[\\[[^\\]]+\\]\\]", "");
-            String[] tokens = line.split("[^\\\\w']+");
+            String[] tokens = line.split("[^a-zA-Z]+");
 
             // Build dense list of ALL valid tokens (not just top-50)
             List<String> validWords = new ArrayList<>();
             for (String token : tokens) {
-                if (token.isEmpty()) continue;
-                if (token.length() < 2) continue;
+                if (token.isEmpty())
+                    continue;
+                if (token.length() < 2)
+                    continue;
                 validWords.add(token);
             }
 
@@ -69,14 +73,17 @@ public class PairsCoOccurrence extends Configured implements Tool {
 
             for (int i = 0; i < validWords.size(); i++) {
                 String center = validWords.get(i);
-                if (!top50.contains(center)) continue;
+                if (!top50.contains(center))
+                    continue;
 
                 int start = Math.max(0, i - d);
                 int end = Math.min(validWords.size() - 1, i + d);
                 for (int j = start; j <= end; j++) {
-                    if (j == i) continue;
+                    if (j == i)
+                        continue;
                     String neighbor = validWords.get(j);
-                    if (!top50.contains(neighbor)) continue;
+                    if (!top50.contains(neighbor))
+                        continue;
 
                     pair.set("(" + center + "," + neighbor + ")");
                     context.write(pair, one);
@@ -86,7 +93,8 @@ public class PairsCoOccurrence extends Configured implements Tool {
     }
 
     /**
-     * Aggregates the local and global counts for each word pair to compute the final co-occurrence frequency.
+     * Aggregates the local and global counts for each word pair to compute the
+     * final co-occurrence frequency.
      */
     public static class ReduceClass extends Reducer<Text, IntWritable, Text, IntWritable> {
         private IntWritable result = new IntWritable();
@@ -129,9 +137,9 @@ public class PairsCoOccurrence extends Configured implements Tool {
                 conf.getInt("cooccur.distance", 1));
         job.setJarByClass(PairsCoOccurrence.class);
 
-//        job.setInputFormatClass(CustomFileInputFormat.class);
-//        org.apache.hadoop.mapreduce.lib.input.CombineFileInputFormat
-//                .setMaxInputSplitSize(job, 134217728);
+        // job.setInputFormatClass(CustomFileInputFormat.class);
+        // org.apache.hadoop.mapreduce.lib.input.CombineFileInputFormat
+        // .setMaxInputSplitSize(job, 134217728);
 
         job.setMapperClass(PairMapper.class);
         job.setCombinerClass(ReduceClass.class);
