@@ -1,0 +1,156 @@
+Assignment II – Problem 1
+MapReduce & Apache Hadoop
+
+---
+
+## PROBLEM 1: CO-OCCURRENCE MATRIX GENERATION
+
+This document contains instructions to build, run, and validate the solution for Problem 1.
+
+---
+
+1. DIRECTORY STRUCTURE
+
+---
+
+Ensure you are inside the following directory:
+
+problem_1/
+
+The important subdirectories are:
+
+* scripts/        → contains build and run scripts
+* src/            → Java source files
+* jars/           → generated JAR files
+* results/        → output files
+* resources/      → stopwords and helper files
+
+---
+
+2. BUILD INSTRUCTIONS
+
+---
+
+Navigate to scripts directory:
+
+cd problem_1/scripts
+
+Run the build script:
+
+bash build.sh
+
+This will:
+
+* Compile Java source files
+* Generate required JAR files:
+
+  * wordcount.jar
+  * pairs.jar
+  * stripes.jar
+  * pairs_class.jar
+  * pairs_func.jar
+  * stripes_class.jar
+  * stripes_func.jar
+
+---
+
+3. RUN INSTRUCTIONS
+
+---
+
+To execute the full pipeline:
+
+bash run_all.sh
+
+This will execute the following steps:
+
+1. WordCount2 (stopword filtered)
+2. TopFrequentWords (top-50 extraction)
+3. Co-occurrence computations for distances:
+
+   * d = 1, 2, 3, 4
+
+For each distance, the following jobs are executed:
+
+* Pairs (1b)
+* Stripes (1c)
+* Pairs (Class-level aggregation)
+* Pairs (Function-level aggregation)
+* Stripes (Class-level aggregation)
+* Stripes (Function-level aggregation)
+
+---
+
+4. OUTPUT LOCATION
+
+---
+
+All outputs are stored in:
+
+problem_1/results/
+
+Key outputs include:
+
+* top50words.txt
+* pairs outputs
+* stripes outputs
+* runtime_log.txt
+
+---
+
+5. VALIDATION INSTRUCTIONS
+
+---
+
+To validate correctness:
+
+bash validate_all.sh
+
+This performs:
+
+* Ground truth comparison
+* Verification of:
+
+  * Top-50 words
+  * Pairs outputs
+  * Stripes outputs
+
+Expected result:
+ALL TESTS PASS for all distances (d = 1 to 4)
+
+---
+
+6. CONFIGURATION DETAILS
+
+---
+
+* Dataset:
+  Wikipedia-EN-20120601_ARTICLES
+
+* Tokenization:
+  Regex used → [^\w']+
+
+* Stopwords:
+  Loaded via Distributed Cache
+
+* Window sizes:
+  d = 1, 2, 3, 4
+
+---
+
+7. NOTES
+
+---
+
+* Ensure Hadoop is properly configured before running
+* Local mode execution may take ~15–20 minutes
+* Runtime may vary due to system load and JVM warm-up
+* Clean previous outputs before rerunning:
+
+rm -rf ../results
+rm -rf ../classes
+
+---
+
+## END OF FILE
+
