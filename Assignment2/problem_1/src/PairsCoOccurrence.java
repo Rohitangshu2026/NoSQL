@@ -42,7 +42,7 @@ public class PairsCoOccurrence extends Configured implements Tool {
 
                     while ((line = reader.readLine()) != null) {
                         String word = line.split("\\s+")[0];
-                        top50.add(word);
+                        top50.add(word.toLowerCase());
                     }
 
                     reader.close();
