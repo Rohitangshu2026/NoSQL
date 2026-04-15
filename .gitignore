@@ -33,3 +33,8 @@ Assignment2/data/Wikipedia-EN-20120601_ARTICLES.tar.gz
 Assignment2/lib/Assignment-2.pdf
 
 
+Assignment2/data/
+Assignment2/problem_1/results/
+*.log
+*.class
+*.jar
