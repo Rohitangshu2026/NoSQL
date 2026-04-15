@@ -1,3 +1,38 @@
+# macOS
+.DS_Store
+
+# Maven
+target/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Java build artifacts
+*.class
+
+# Database
+scripts.sql
+
+# Assignment 2 generated/build artifacts
+Assignment2/problem_2/problem_2a.txt
+Assignment2/problem_2/problem_2b.txt
+Assignment2/problem_2/build/
+
+# Optional local Hadoop outputs
+Assignment2/problem_2/results/output_problem_2a*/
+Assignment2/problem_2/results/output_problem_2b*/
+
+# Assignment 2 datasets
+Assignment2/data/Wikipedia-50-ARTICLES/
+Assignment2/data/Wikipedia-EN-20120601_ARTICLES/
+Assignment2/data/Wikipedia-EN-20120601_ARTICLES.tar.gz
+
+# Assignment handout
+Assignment2/lib/Assignment-2.pdf
+
+
 Assignment2/data/
 Assignment2/problem_1/results/
 *.log

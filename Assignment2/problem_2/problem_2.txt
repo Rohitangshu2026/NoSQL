@@ -1,0 +1,191 @@
+Problem 2: Indexing Documents via Hadoop
+
+Overview
+Problem 2 is implemented as a two-stage MapReduce pipeline:
+
+1. Problem 2(a): Compute document frequency (DF) for each term.
+2. Problem 2(b): Use the top 100 DF terms to compute per-document TF-based scores.
+
+The smaller dataset Wikipedia-50-ARTICLES.tar may be used for testing.
+All final experiments should be run on Wikipedia-EN-20120601_ARTICLES.tar.gz.
+
+Files used
+- problem_2/src/DocumentFrequency.java
+- problem_2/src/TfIdfScore.java
+- problem_2/src/WholeFileInputFormat.java
+- problem_2/src/WholeFileRecordReader.java
+- problem_2/src/TextProcessingUtils.java
+- data/stopwords.txt
+- lib/opennlp-tools-1.9.3.jar
+
+Input format
+- Each Wikipedia article must be available as a separate .txt file in an extracted directory.
+- Each mapper reads one whole article as one document.
+
+Compilation
+Run the following from the Assignment2 root directory.
+Adjust JAVA_HOME and HADOOP_HOME before compiling.
+
+Example:
+mkdir -p problem_2/build/classes problem_2/jars
+javac -d problem_2/build/classes -cp ".:$HADOOP_HOME/share/hadoop/common/*:$HADOOP_HOME/share/hadoop/common/lib/*:$HADOOP_HOME/share/hadoop/mapreduce/*:$HADOOP_HOME/share/hadoop/mapreduce/lib/*:lib/opennlp-tools-1.9.3.jar" problem_2/src/DocumentFrequency.java problem_2/src/TfIdfScore.java problem_2/src/WholeFileInputFormat.java problem_2/src/WholeFileRecordReader.java problem_2/src/TextProcessingUtils.java
+
+Create jars
+Example:
+cd problem_2/build/classes
+jar cfe ~/assignment2-problem2-jars/document_frequency.jar DocumentFrequency DocumentFrequency*.class TextProcessingUtils.class WholeFileInputFormat.class WholeFileRecordReader.class
+jar cfe ~/assignment2-problem2-jars/tfidf_score.jar TfIdfScore TfIdfScore*.class TextProcessingUtils.class WholeFileInputFormat.class WholeFileRecordReader.class
+cp ~/assignment2-problem2-jars/document_frequency.jar /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/jars/
+cp ~/assignment2-problem2-jars/tfidf_score.jar /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/jars/
+
+OpenNLP runtime dependency
+Before running Hadoop jobs, ensure the OpenNLP jar is visible to Hadoop.
+
+Example:
+export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:/mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/lib/opennlp-tools-1.9.3.jar
+
+Dataset extraction
+Run the following from the Assignment2 root directory.
+
+Small dataset:
+tar -xf data/Wikipedia-50-ARTICLES.tar -C data/
+
+Full dataset:
+tar -xf data/Wikipedia-EN-20120601_ARTICLES.tar.gz -C data/
+
+Problem 2(a): Document Frequency
+Goal:
+Compute TERM<TAB>DF where DF is the number of distinct documents containing the term.
+
+Processing:
+1. Tokens are lowercased and cleaned.
+2. Stopwords are removed.
+3. Porter stemming is applied.
+4. Each term is emitted at most once per document.
+5. Reducer sums counts to obtain DF.
+
+Additional preprocessing used:
+- remove tokens with digits
+- remove tokens shorter than 3 characters
+- remove common markup artifacts: apo, categori, extern, http, link, quot, refer
+- stopwords are checked both before and after stemming
+These filters are applied in the mapper before emitting terms.
+
+Run example on the small dataset:
+hadoop jar problem_2/jars/document_frequency.jar data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2a data/stopwords.txt
+
+Run example on the full dataset:
+hadoop jar problem_2/jars/document_frequency.jar data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2a_full data/stopwords.txt
+
+Output:
+problem_2/results/output_problem_2a/part-r-00000
+or
+problem_2/results/output_problem_2a_full/part-r-00000
+
+Generate the top 100 DF terms
+Use the output of Problem 2(a):
+
+Small dataset example:
+sort -k2,2nr problem_2/results/output_problem_2a/part-r-00000 | head -100 > problem_2/results/top100_df.tsv
+
+Full dataset example:
+sort -k2,2nr problem_2/results/output_problem_2a_full/part-r-00000 | head -100 > problem_2/results/top100_df.tsv
+
+Problem 2(b): TF-based Score per Document
+Goal:
+For each document and each of the top 100 terms, compute:
+SCORE = TF * log(10000 / DF + 1)
+
+Output format:
+ID<TAB>TERM<TAB>SCORE
+
+Processing:
+1. Load top100_df.tsv from distributed cache.
+2. For each document, count TF only for the selected top 100 terms.
+3. Compute the score using the DF value from top100_df.tsv.
+4. Write the final TSV output.
+
+Additional preprocessing used:
+- remove tokens with digits
+- remove tokens shorter than 3 characters
+- remove common markup artifacts: apo, categori, extern, http, link, quot, refer
+- stopwords are checked both before and after stemming
+These filters are applied in the mapper before emitting terms.
+
+Screenshots
+Save runtime/output screenshots under:
+problem_2/results/screenshots/
+
+Measured runtimes (full dataset)
+Run with Linux-native dataset and conservative local-mode settings:
+- Problem 2(a): real 4m19.412s
+- Problem 2(b): real 4m6.313s
+
+Run example on the small dataset:
+hadoop jar problem_2/jars/tfidf_score.jar data/Wikipedia-50-ARTICLES problem_2/results/output_problem_2b data/stopwords.txt problem_2/results/top100_df.tsv
+
+Run example on the full dataset:
+hadoop jar problem_2/jars/tfidf_score.jar data/Wikipedia-EN-20120601_ARTICLES problem_2/results/output_problem_2b_full data/stopwords.txt problem_2/results/top100_df.tsv
+
+Output:
+problem_2/results/output_problem_2b/part-r-00000
+or
+problem_2/results/output_problem_2b_full/part-r-00000
+
+Suggested workflow for the full dataset
+1. Extract Wikipedia-EN-20120601_ARTICLES.tar.gz
+2. Run Problem 2(a)
+3. Sort output and create top100_df.tsv
+4. Run Problem 2(b)
+5. Save runtime outputs and screenshots for the report
+
+Full dataset runs (recommended for WSL)
+For stability and speed, run the full dataset from Linux home storage and copy results back.
+
+Example:
+1) Extract to Linux home:
+tar -xf data/Wikipedia-EN-20120601_ARTICLES.tar.gz -C ~/assignment2-data/
+
+2) Run 2(a) in Linux home:
+hadoop jar problem_2/jars/document_frequency.jar ~/assignment2-data/Wikipedia-EN-20120601_ARTICLES ~/assignment2-problem2-full/output_problem_2a_full data/stopwords.txt
+
+3) Copy DF output into repo:
+cp ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000 problem_2/results/df_values.tsv
+sort -k2,2nr problem_2/results/df_values.tsv | head -100 > problem_2/results/top100_df.tsv
+
+4) Run 2(b) in Linux home:
+hadoop jar problem_2/jars/tfidf_score.jar ~/assignment2-data/Wikipedia-EN-20120601_ARTICLES ~/assignment2-problem2-full/output_problem_2b_full data/stopwords.txt problem_2/results/top100_df.tsv
+
+5) Copy TF-IDF output into repo:
+cp ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000 problem_2/results/tfidf_scores_full.tsv
+
+Useful commands
+Inspect DF output:
+head ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000
+
+Inspect final score output:
+head ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000
+
+Count output rows:
+wc -l ~/assignment2-problem2-full/output_problem_2a_full/part-r-00000
+wc -l ~/assignment2-problem2-full/output_problem_2b_full/part-r-00000
+
+Notes
+- Delete any previous Hadoop output directory before re-running a job.
+- Use the small dataset only for development/testing.
+- Use the full dataset for final experiments and screenshots.
+- The JARs include the main class; no class name is needed after `hadoop jar`.
+
+Full correctness verification (optional)
+To fully verify every output score against the dataset and top-100 DF list, use:
+
+Compile:
+cd problem_2
+javac -cp ".:/mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/lib/opennlp-tools-1.9.3.jar" src/VerifyTfIdf.java src/TextProcessingUtils.java
+
+Run:
+java -cp ".:/mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/lib/opennlp-tools-1.9.3.jar:src" VerifyTfIdf \
+  /home/jack/assignment2-data/Wikipedia-EN-20120601_ARTICLES \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/results/top100_df.tsv \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/problem_2/results/tfidf_scores_full.tsv \
+  /mnt/c/Users/manzi/Downloads/NoSQL-main/NoSQL-main/NoSQL/Assignment2/data/stopwords.txt
