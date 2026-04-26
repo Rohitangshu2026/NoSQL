@@ -9,8 +9,15 @@ import java.time.format.DateTimeParseException;
 import java.util.Locale;
 
 public class LogParser {
-    private static final String LOG_PATTERN = "^(\\S+) \\[(\\w{3}) (\\w{3}) (\\d{2}) (\\d{2}):\\d{2}:\\d{2} (\\d{4})\\] \"([^\"]*)\" (\\d{3}) (\\S+)$";
-    private static final Pattern PATTERN = Pattern.compile(LOG_PATTERN);
+    // Robust Regex:
+    // 1. Uses \\s+ to handle variable spacing.
+    // 2. Uses (.*?) to capture the whole HTTP request, preventing failures on malformed requests like "GET /".
+    // 3. Ends with \\s*$ to tolerate trailing whitespaces or carriage returns (\r), which cause matcher.matches() to fail.
+    private static final Pattern PATTERN = Pattern.compile(
+            "^(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+\\[(.*?)\\]\\s+\"(.*?)\"\\s+(\\d{3})\\s+(\\S+)\\s*$"
+    );
+    
+    // Updated date format to handle "01/Jul/1995:00:00:01 -0400" by explicitly capturing up to the year
     private static final DateTimeFormatter INPUT_DATE_FORMAT = DateTimeFormatter.ofPattern("dd/MMM/yyyy", Locale.ENGLISH);
     private static final DateTimeFormatter OUT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
@@ -22,20 +29,20 @@ public class LogParser {
 
         try {
             String host = matcher.group(1);
-            // Group 2 is day of week, discarded
-            String month = matcher.group(3);
-            String day = matcher.group(4);
-            String hourStr = matcher.group(5);
-            String year = matcher.group(6);
-            String requestStr = matcher.group(7);
-            String statusStr = matcher.group(8);
-            String bytesStr = matcher.group(9);
+            String datetimeStr = matcher.group(4); // e.g., "01/Jul/1995:00:00:01 -0400"
+            String requestStr = matcher.group(5);  // e.g., "GET /history/apollo/ HTTP/1.0"
+            String statusStr = matcher.group(6);
+            String bytesStr = matcher.group(7);
 
-            String rawDate = day + "/" + month + "/" + year;
+            // Parse datetime
+            String[] dtParts = datetimeStr.split(":");
+            if (dtParts.length < 2) return Optional.empty();
+            String rawDate = dtParts[0]; // "01/Jul/1995"
             String isoDate = LocalDate.parse(rawDate, INPUT_DATE_FORMAT).format(OUT_FMT);
-            int hour = Integer.parseInt(hourStr);
+            int hour = Integer.parseInt(dtParts[1]);
 
-            String[] requestParts = requestStr.split(" ");
+            // Parse request string safely
+            String[] requestParts = requestStr.split("\\s+");
             String method = requestParts.length > 0 ? requestParts[0] : "UNKNOWN";
             String path = requestParts.length > 1 ? requestParts[1] : "UNKNOWN";
             String protocol = requestParts.length > 2 ? requestParts[2] : "UNKNOWN";
@@ -58,3 +65,4 @@ public class LogParser {
         }
     }
 }
+
