@@ -14,8 +14,10 @@ CREATE TABLE etl_runs (
 
 CREATE TABLE etl_results (
   id INT AUTO_INCREMENT PRIMARY KEY,
+  pipeline VARCHAR(20) NOT NULL,
   run_id VARCHAR(36) NOT NULL,
   batch_id INT NOT NULL,
+  executed_at TIMESTAMP NOT NULL,
   query_name VARCHAR(30) NOT NULL,
   log_date DATE DEFAULT NULL,
   status_code INT DEFAULT NULL,

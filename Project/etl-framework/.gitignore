@@ -5,3 +5,4 @@ target/
 config/db.properties
 .idea/
 *.iml
+data

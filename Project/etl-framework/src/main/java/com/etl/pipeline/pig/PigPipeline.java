@@ -1,69 +1,83 @@
 package com.etl.pipeline.pig;
 
 import com.etl.core.ETLConfig;
+import com.etl.core.LogParser;
 import com.etl.core.Pipeline;
 import com.etl.core.PipelineResult;
 import com.etl.core.ResultRow;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.pig.ExecType;
 import org.apache.pig.PigServer;
-import org.apache.pig.backend.executionengine.ExecJob;
-import org.apache.pig.tools.pigstats.PigStats;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.sql.Date;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 public class PigPipeline implements Pipeline {
 
     @Override
     public PipelineResult execute(ETLConfig config) throws Exception {
+        Instant startedAt = Instant.now();
         long startTime = System.currentTimeMillis();
-        long totalRecords = 0;
-        int totalBatches = 0; // Number of Pig jobs
-        long malformedCount = 0; // Documented limitation: Pig pipeline malformed count is not directly aggregated here without extra pass
+        BatchPrepResult batchPrep = prepareBatches(config.getInputPath(), config.getBatchSize(), config.getRunId().toString());
+        long totalRecords = batchPrep.totalRecords;
+        int totalBatches = batchPrep.batchFiles.size();
+        long malformedCount = batchPrep.malformedRecords;
         List<ResultRow> rows = new ArrayList<>();
 
         String[] queries = {"daily_traffic", "top_resources", "hourly_errors"};
 
         PigServer pigServer = new PigServer(ExecType.MAPREDUCE);
+        Configuration conf = new Configuration();
+        FileSystem fs = FileSystem.get(conf);
 
-        for (String query : queries) {
-            String outPath = "/tmp/etl_out/" + config.getRunId() + "/" + query;
-            
-            Map<String, String> params = new HashMap<>();
-            params.put("INPUT", config.getInputPath());
-            params.put("OUTPUT", outPath);
-            
-            String scriptPath = "pig/" + query + ".pig";
-            
-            pigServer.registerScript(scriptPath, params);
-            
-            // Read outputs from HDFS
-            Configuration conf = new Configuration();
-            Path path = new Path(outPath);
-            rows.addAll(readResults(conf, path, query));
-            totalBatches++;
+        for (int i = 0; i < batchPrep.batchFiles.size(); i++) {
+            int batchId = i + 1;
+            String batchInput = batchPrep.batchFiles.get(i).toString();
+
+            for (String query : queries) {
+                String outPath = "/tmp/etl_out/" + config.getRunId() + "/batch-" + batchId + "/" + query;
+                Path outputPath = new Path(outPath);
+                if (fs.exists(outputPath)) {
+                    fs.delete(outputPath, true);
+                }
+
+                Map<String, String> params = new HashMap<>();
+                params.put("INPUT", batchInput);
+                params.put("OUTPUT", outPath);
+
+                String scriptPath = "pig/" + query + ".pig";
+
+                pigServer.registerScript(scriptPath, params);
+
+                if (!fs.exists(outputPath)) {
+                    throw new IllegalStateException("Pig query '" + query + "' finished without creating output at " + outPath);
+                }
+                rows.addAll(readResults(conf, outputPath, query, batchId));
+            }
         }
 
-        // To calculate total records properly, we could inspect PigStats or do a dedicated count. 
-        // For simplicity, we assign a placeholder or estimate if PigStats doesn't yield it easily.
-        // Documented simplification: Batch size in Pig = total records / number of Pig jobs.
-        // If we really need total records, we could read it from the first job's output or stats.
-        // We will assign totalRecords based on a rough read if available.
-        totalRecords = rows.size(); // Simplified fallback. In production, use PigStats or dedicated counter.
+        rows = postProcessTopResources(rows);
 
+        Instant finishedAt = Instant.now();
         long runtimeMs = System.currentTimeMillis() - startTime;
-        return new PipelineResult(totalRecords, totalBatches, malformedCount, runtimeMs, rows);
+        return new PipelineResult(totalRecords, totalBatches, malformedCount, runtimeMs, startedAt, finishedAt, rows);
     }
 
-    private List<ResultRow> readResults(Configuration conf, Path outPath, String queryName) throws Exception {
+    private List<ResultRow> readResults(Configuration conf, Path outPath, String queryName, int batchId) throws Exception {
         List<ResultRow> results = new ArrayList<>();
         FileSystem fs = FileSystem.get(conf);
         org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> fileStatusListIterator = fs.listFiles(outPath, true);
@@ -75,7 +89,6 @@ public class PigPipeline implements Pipeline {
                     String line;
                     while ((line = br.readLine()) != null) {
                         String[] parts = line.split("\\t");
-                        int batchId = 1; // Pig pipeline doesn't have native mapper split awareness for batch id in output easily
 
                         ResultRow row = new ResultRow(batchId, queryName);
 
@@ -105,5 +118,124 @@ public class PigPipeline implements Pipeline {
             }
         }
         return results;
+    }
+
+    private List<ResultRow> postProcessTopResources(List<ResultRow> allRows) {
+        List<ResultRow> finalRows = new ArrayList<>();
+        List<ResultRow> topResourceRows = new ArrayList<>();
+
+        for (ResultRow row : allRows) {
+            if ("top_resources".equals(row.getQueryName())) {
+                topResourceRows.add(row);
+            } else {
+                finalRows.add(row);
+            }
+        }
+
+        topResourceRows.stream()
+                .collect(Collectors.groupingBy(ResultRow::getBatchId))
+                .forEach((batchId, batchRows) -> {
+                    batchRows.sort(Comparator.comparing(ResultRow::getRequestCount).reversed());
+                    finalRows.addAll(batchRows.stream().limit(20).collect(Collectors.toList()));
+                });
+
+        return finalRows;
+    }
+
+    private BatchPrepResult prepareBatches(String inputPath, int batchSize, String runId) throws Exception {
+        Configuration conf = new Configuration();
+        Path rootPath = new Path(inputPath);
+        FileSystem fs = rootPath.getFileSystem(conf);
+        FileSystem localFs = FileSystem.getLocal(conf);
+        Path batchDir = new Path("/tmp/etl_batches/" + runId);
+
+        if (localFs.exists(batchDir)) {
+            localFs.delete(batchDir, true);
+        }
+        localFs.mkdirs(batchDir);
+
+        List<Path> inputFiles = collectInputFiles(fs, rootPath);
+        List<Path> batchFiles = new ArrayList<>();
+
+        long total = 0;
+        long malformed = 0;
+        int batchNumber = 1;
+        int currentBatchSize = 0;
+        BufferedWriter writer = null;
+
+        try {
+            for (Path inputFile : inputFiles) {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(fs.open(inputFile)))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (writer == null || currentBatchSize == batchSize) {
+                            if (writer != null) {
+                                writer.close();
+                            }
+                            Path batchFile = new Path(batchDir, String.format("batch-%05d.log", batchNumber));
+                            FSDataOutputStream out = localFs.create(batchFile, true);
+                            writer = new BufferedWriter(new OutputStreamWriter(out));
+                            batchFiles.add(batchFile);
+                            batchNumber++;
+                            currentBatchSize = 0;
+                        }
+
+                        writer.write(line);
+                        writer.newLine();
+                        currentBatchSize++;
+                        total++;
+
+                        if (!LogParser.parse(line).isPresent()) {
+                            malformed++;
+                        }
+                    }
+                }
+            }
+        } finally {
+            if (writer != null) {
+                writer.close();
+            }
+        }
+
+        return new BatchPrepResult(batchFiles, total, malformed);
+    }
+
+    private List<Path> collectInputFiles(FileSystem fs, Path rootPath) throws Exception {
+        List<Path> inputFiles = new ArrayList<>();
+
+        if (fs.isFile(rootPath)) {
+            inputFiles.add(rootPath);
+            return inputFiles;
+        }
+
+        org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> files = fs.listFiles(rootPath, true);
+        while (files.hasNext()) {
+            org.apache.hadoop.fs.LocatedFileStatus file = files.next();
+            if (!file.isFile()) {
+                continue;
+            }
+
+            String name = file.getPath().getName();
+            if (name.startsWith("_") || name.startsWith(".")) {
+                continue;
+            }
+
+            inputFiles.add(file.getPath());
+        }
+
+        Collections.sort(inputFiles, Comparator.comparing(Path::toString));
+        return inputFiles;
+    }
+
+    private static final class BatchPrepResult {
+        private final List<Path> batchFiles;
+        private final long totalRecords;
+        private final long malformedRecords;
+
+        private BatchPrepResult(List<Path> batchFiles, long totalRecords, long malformedRecords) {
+            this.batchFiles = batchFiles;
+            this.totalRecords = totalRecords;
+            this.malformedRecords = malformedRecords;
+        }
     }
 }

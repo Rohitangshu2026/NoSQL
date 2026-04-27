@@ -6,6 +6,8 @@ import com.etl.core.PipelineResult;
 import com.etl.db.ResultLoader;
 import com.etl.report.Reporter;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.UUID;
 
 public class ETLRunner {
@@ -50,10 +52,14 @@ public class ETLRunner {
         ETLConfig config = new ETLConfig(pipelineName, inputPath, batchSize, runId, dbUrl, dbUser, dbPass);
 
         try {
+            long overallStartMs = System.currentTimeMillis();
             Pipeline pipeline = PipelineFactory.create(pipelineName);
             PipelineResult result = pipeline.execute(config);
 
             ResultLoader.load(config, result);
+            Instant overallFinishedAt = Instant.now();
+            long overallRuntimeMs = System.currentTimeMillis() - overallStartMs;
+            ResultLoader.updateExecutionMetadata(config, Timestamp.from(overallFinishedAt), overallRuntimeMs);
             Reporter.printReport(config, result);
 
         } catch (UnsupportedOperationException e) {
