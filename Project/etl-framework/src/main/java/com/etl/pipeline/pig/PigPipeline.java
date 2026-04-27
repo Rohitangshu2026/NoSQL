@@ -32,10 +32,10 @@ public class PigPipeline implements Pipeline {
 
         String[] queries = {"daily_traffic", "top_resources", "hourly_errors"};
 
-        PigServer pigServer = new PigServer(ExecType.MAPREDUCE);
+        PigServer pigServer = new PigServer(ExecType.LOCAL);
 
         for (String query : queries) {
-            String outPath = "/tmp/etl_out/" + config.getRunId() + "/" + query;
+            String outPath = "/tmp/etl_out_pig/" + config.getRunId() + "/" + query;
             
             Map<String, String> params = new HashMap<>();
             params.put("INPUT", config.getInputPath());
@@ -47,6 +47,7 @@ public class PigPipeline implements Pipeline {
             
             // Read outputs from HDFS
             Configuration conf = new Configuration();
+            conf.set("fs.defaultFS", "file:///");
             Path path = new Path(outPath);
             rows.addAll(readResults(conf, path, query));
             totalBatches++;
