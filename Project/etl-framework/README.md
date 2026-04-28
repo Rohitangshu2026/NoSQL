@@ -12,130 +12,263 @@ The framework has three layers: a **controller layer** that owns the CLI, run ID
 
 ```mermaid
 classDiagram
-    class ETLRunner {
-        +main(String[] args)
-    }
-    class PipelineFactory {
-        +create(String name) Pipeline
-    }
-    class Pipeline {
-        <<interface>>
-        +execute(ETLConfig config) PipelineResult
-    }
-    class ETLConfig {
-        -String pipelineName
-        -String inputPath
-        -int batchSize
-        -UUID runId
-        -String dbUrl
-        -String dbUser
-        -String dbPassword
-    }
-    class PipelineResult {
-        -long totalRecords
-        -int totalBatches
-        -long malformedCount
-        -long runtimeMs
-        -List~ResultRow~ rows
-        +avgBatchSize() double
-    }
-    class ResultRow {
-        -int batchId
-        -String queryName
-        -Date logDate
-        -Integer statusCode
-        -String resourcePath
-        -Integer logHour
-        -Long requestCount
-        -Long totalBytes
-        -Integer distinctHosts
-        -Integer errorRequestCount
-        -Integer totalRequestCount
-        -Double errorRate
-        -Integer distinctErrorHosts
-    }
-    class LogParser {
-        +parse(String line) Optional~LogRecord~
-    }
-    class LogRecord {
-        +String host
-        +String logDate
-        +int logHour
-        +String method
-        +String resourcePath
-        +String protocol
-        +int statusCode
-        +long bytes
-    }
-    class ResultLoader {
-        +load(ETLConfig, PipelineResult)
-    }
-    class Reporter {
-        +printReport(ETLConfig, PipelineResult)
-    }
 
-    ETLRunner --> PipelineFactory : uses
-    ETLRunner --> Pipeline : executes
-    ETLRunner --> ResultLoader : saves results
-    ETLRunner --> Reporter : prints report
-    PipelineFactory ..> Pipeline : creates
-    Pipeline ..> PipelineResult : returns
-    PipelineResult "1" *-- "*" ResultRow : contains
-    Pipeline ..> LogParser : delegates parsing to
-    LogParser ..> LogRecord : produces
+class ETLRunner {
+    +main(String[] args)
+}
+
+class PipelineFactory {
+    +create(String name) Pipeline
+}
+
+class Pipeline {
+    <<interface>>
+    +execute(ETLConfig config) PipelineResult
+}
+
+class MapReducePipeline {
+    +execute(ETLConfig config) PipelineResult
+}
+
+class PigPipeline {
+    +execute(ETLConfig config) PipelineResult
+}
+
+class MongoDBPipeline {
+    +execute(ETLConfig config) PipelineResult
+}
+
+class HivePipeline {
+    +execute(ETLConfig config) PipelineResult
+}
+
+class ETLConfig {
+    -String pipelineName
+    -String inputPath
+    -int batchSize
+    -UUID runId
+    -String dbUrl
+    -String dbUser
+    -String dbPassword
+}
+
+class PipelineResult {
+    -long totalRecords
+    -int totalBatches
+    -long malformedCount
+    -long runtimeMs
+    -List~ResultRow~ rows
+    +avgBatchSize() double
+}
+
+class ResultRow {
+    -int batchId
+    -String queryName
+    -Date logDate
+    -Integer statusCode
+    -String resourcePath
+    -Integer logHour
+    -Long requestCount
+    -Long totalBytes
+    -Integer distinctHosts
+    -Integer errorRequestCount
+    -Integer totalRequestCount
+    -Double errorRate
+    -Integer distinctErrorHosts
+}
+
+class LogParser {
+    +parse(String line) Optional~LogRecord~
+}
+
+class LogRecord {
+    +String host
+    +String logDate
+    +int logHour
+    +String method
+    +String resourcePath
+    +String protocol
+    +int statusCode
+    +long bytes
+}
+
+class ResultLoader {
+    +load(ETLConfig, PipelineResult)
+}
+
+class Reporter {
+    +printReport(ETLConfig, PipelineResult)
+}
+
+class LogMapper
+class QueryReducer
+
+%% Relationships
+
+ETLRunner --> PipelineFactory : uses
+ETLRunner --> Pipeline : executes
+ETLRunner --> ResultLoader : saves results
+ETLRunner --> Reporter : prints report
+
+PipelineFactory ..> Pipeline : creates
+
+Pipeline <|.. MapReducePipeline
+Pipeline <|.. PigPipeline
+Pipeline <|.. MongoDBPipeline
+Pipeline <|.. HivePipeline
+
+Pipeline ..> PipelineResult : returns
+PipelineResult "1" *-- "*" ResultRow : contains
+
+%% Parsing flow
+LogMapper --> LogParser : uses
+LogParser --> LogRecord : produces
+
+%% MapReduce internals
+MapReducePipeline --> LogMapper
+MapReducePipeline --> QueryReducer
 ```
 
 ### Execution Flow
 
 ```mermaid
 flowchart TD
-    A[Start ETLRunner] --> B[Parse CLI Arguments]
-    B --> C[Generate UUID run_id / Build ETLConfig]
-    C --> D{--pipeline}
 
-    D -- mapreduce --> E[MapReducePipeline]
-    D -- pig --> F[PigPipeline]
-    D -- mongodb --> G[MongoDBPipeline stub]
-    D -- hive --> H[HivePipeline stub]
+A[Start ETLRunner] --> B[Parse CLI Arguments]
+B --> C[Generate UUID run_id / Build ETLConfig]
 
-    E --> I[3 sequential MR jobs]
-    F --> J[3 Pig Latin scripts via PigServer]
+C --> D{Select Pipeline}
 
-    I --> K[Read output → List of ResultRow]
-    J --> K
+D -->|mapreduce| E[MapReducePipeline]
+D -->|pig| F[PigPipeline]
+D -->|mongodb| G[MongoDBPipeline stub]
+D -->|hive| H[HivePipeline stub]
 
-    K --> L[ResultLoader: JDBC insert to etl_runs + etl_results]
-    L --> M[Reporter: print run metadata + query tables]
-    M --> N[End]
+%% Query Fanout
+E --> Q1[Run Query: daily_traffic]
+E --> Q2[Run Query: top_resources]
+E --> Q3[Run Query: hourly_errors]
+
+F --> P1[Run Script: daily_traffic.pig]
+F --> P2[Run Script: top_resources.pig]
+F --> P3[Run Script: hourly_errors.pig]
+
+%% Execution Layer
+Q1 --> R1[MapReduce Job → Global Aggregation]
+Q2 --> R2[MapReduce Job → Global Aggregation]
+Q3 --> R3[MapReduce Job → Global Aggregation]
+
+P1 --> S1[Pig Script → Global Aggregation]
+P2 --> S2[Pig Script → Global Aggregation]
+P3 --> S3[Pig Script → Global Aggregation]
+
+%% Collect results
+R1 --> T[Read outputs → List<ResultRow>]
+R2 --> T
+R3 --> T
+
+S1 --> T
+S2 --> T
+S3 --> T
+
+%% Post-processing
+T --> U[Post-process (Top 20 resources globally)]
+
+%% Load
+U --> V[ResultLoader: Insert into etl_runs + etl_results]
+
+%% Reporting
+V --> W[Reporter: Print metadata + final query results]
+
+W --> X[End]
 ```
 
 ### MapReduce Pipeline — Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Runner as ETLRunner
-    participant MR as MapReducePipeline
-    participant FS as FileSystem (local/HDFS)
-    participant DB as MySQL
 
-    Runner->>MR: execute(config)
+participant Runner as ETLRunner
+participant MR as MapReducePipeline
+participant FS as FileSystem (local/HDFS)
+participant Loader as ResultLoader
+participant DB as MySQL
 
-    rect rgb(240, 248, 255)
-    Note over MR,FS: 3 sequential jobs
-    MR->>FS: Job 1 — daily_traffic (LogMapper → QueryReducer)
-    FS-->>MR: part-r-00000
-    MR->>FS: Job 2 — top_resources (LogMapper → QueryReducer)
-    FS-->>MR: part-r-00000
-    MR->>FS: Job 3 — hourly_errors (LogMapper → QueryReducer)
-    FS-->>MR: part-r-00000
-    end
+Runner->>MR: execute(config)
 
-    MR->>MR: readResults() — parse tab-separated output
-    MR->>MR: postProcessTopResources() — keep top 20 per batch
-    MR-->>Runner: PipelineResult
+rect rgb(240, 248, 255)
+Note over MR,FS: Execute 3 queries (global aggregation)
 
-    Runner->>DB: ResultLoader.load() — INSERT etl_runs, batch INSERT etl_results
-    DB-->>Runner: committed
+MR->>FS: Job 1 — daily_traffic\n(LogMapper → QueryReducer)
+FS-->>MR: part-r-00000
+
+MR->>FS: Job 2 — top_resources\n(LogMapper → QueryReducer)
+FS-->>MR: part-r-00000
+
+MR->>FS: Job 3 — hourly_errors\n(LogMapper → QueryReducer)
+FS-->>MR: part-r-00000
+end
+
+MR->>MR: readResults()\n(parse tab-separated output)
+
+MR->>MR: postProcessTopResources()\n(keep top 20 globally)
+
+MR-->>Runner: PipelineResult
+
+Runner->>Loader: load(config, result)
+
+Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_results
+
+DB-->>Loader: commit
+Loader-->>Runner: success
+```
+### Pig Pipeline — Sequence
+
+```mermaid
+sequenceDiagram
+
+participant Runner as ETLRunner
+participant Pig as PigPipeline
+participant PS as PigServer
+participant FS as FileSystem (local/HDFS)
+participant Loader as ResultLoader
+participant DB as MySQL
+
+Runner->>Pig: execute(config)
+
+rect rgb(240, 248, 255)
+Note over Pig,PS: Execute 3 queries (global aggregation)
+
+Pig->>PS: Register Script — daily_traffic.pig\n(params: INPUT, OUTPUT)
+PS->>FS: Load input + execute Pig Latin
+FS-->>PS: output files (part-r-00000)
+PS-->>Pig: script completed
+
+Pig->>PS: Register Script — top_resources.pig\n(params: INPUT, OUTPUT)
+PS->>FS: Load input + execute Pig Latin
+FS-->>PS: output files (part-r-00000)
+PS-->>Pig: script completed
+
+Pig->>PS: Register Script — hourly_errors.pig\n(params: INPUT, OUTPUT)
+PS->>FS: Load input + execute Pig Latin
+FS-->>PS: output files (part-r-00000)
+PS-->>Pig: script completed
+end
+
+Pig->>Pig: readResults()\n(parse tab-separated output)
+
+Pig->>Pig: postProcessTopResources()\n(keep top 20 globally)
+
+Pig-->>Runner: PipelineResult
+
+Runner->>Loader: load(config, result)
+
+Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_results
+
+DB-->>Loader: commit
+Loader-->>Runner: success
 ```
 
 ---
@@ -272,26 +405,81 @@ All three queries are implemented identically across every pipeline. The same gr
 
 ## Database Schema
 
-Two tables in `etldb`:
+We use two tables in `etldb` to separate **execution metadata** from **query results**.
 
-**`etl_runs`** — one row per pipeline execution:
+---
+
+### **`etl_runs`** — one row per pipeline execution
+
+Stores metadata about each ETL run.
 
 | Column | Type | Description |
 |---|---|---|
 | `run_id` | VARCHAR(36) PK | UUID generated at startup |
-| `pipeline` | VARCHAR(20) | mapreduce / pig / mongodb / hive |
-| `batch_size` | INT | configured records per batch |
-| `total_records` | INT | total records processed |
-| `total_batches` | INT | number of non-empty batches |
-| `malformed_count` | INT | records that failed parsing |
-| `runtime_ms` | BIGINT | wall-clock ms: first read → last DB write |
-| `executed_at` | TIMESTAMP | auto-set on insert |
-
-**`etl_results`** — one row per (run × batch × query × group-by key), discriminated by `query_name`. Columns not relevant to a given query are NULL.
-
-See `sql/schema.sql` for the full DDL and `sql/sample_queries.sql` for example reporting queries.
+| `pipeline` | VARCHAR(20) | Execution backend (mapreduce / pig / mongodb / hive) |
+| `batch_size` | INT | Configured records per batch |
+| `total_records` | INT | Total records processed |
+| `total_batches` | INT | Number of batches processed (input splits / logical batches) |
+| `malformed_count` | INT | Records that failed parsing |
+| `runtime_ms` | BIGINT | End-to-end runtime (read → compute → DB write) |
+| `executed_at` | TIMESTAMP | Auto-generated timestamp of execution |
 
 ---
+
+### **`etl_results`** — query outputs (unified schema)
+
+Stores results of all queries across all pipelines.
+
+> One row represents a **(run × query × group-by key)**.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INT PK | Auto-increment row identifier |
+| `run_id` | VARCHAR(36) FK | Links to `etl_runs` |
+| `pipeline` | VARCHAR(20) | Redundant for faster filtering |
+| `batch_id` | INT | Always `1` for global aggregation (legacy support for batching) |
+| `query_name` | VARCHAR(30) | Query identifier (`daily_traffic`, `top_resources`, `hourly_errors`) |
+
+#### Query-specific columns (sparse schema)
+
+| Column | Used in | Description |
+|---|---|---|
+| `log_date` | Q1, Q3 | Date of request |
+| `status_code` | Q1 | HTTP status code |
+| `resource_path` | Q2 | Requested resource |
+| `log_hour` | Q3 | Hour of request |
+| `request_count` | Q1, Q2 | Total requests |
+| `total_bytes` | Q1, Q2 | Total bytes transferred |
+| `distinct_hosts` | Q2 | Unique hosts accessing resource |
+| `error_request_count` | Q3 | Number of error requests |
+| `total_request_count` | Q3 | Total requests in that hour |
+| `error_rate` | Q3 | error_request_count / total_request_count |
+| `distinct_error_hosts` | Q3 | Unique hosts causing errors |
+
+> Columns not relevant to a query remain **NULL**.
+
+---
+
+### Design Rationale
+
+- **Separation of concerns**  
+  `etl_runs` stores execution metadata, while `etl_results` stores analytical outputs.
+
+- **Unified results table**  
+  A single table is used for all queries using `query_name` as a discriminator, avoiding schema duplication.
+
+- **Global aggregation compatibility**  
+  Since pipelines now produce **global aggregates**, each query result appears once per key (`batch_id = 1`).
+
+- **Extensibility**  
+  New queries or pipelines can be added without changing schema—only new rows are inserted.
+
+- **Query simplicity**  
+  Results can be easily filtered using:
+  ```sql
+  WHERE run_id = ? AND query_name = ?
+
+See sql/schema.sql for full DDL and sql/sample_queries.sql for reporting queries.
 
 ## Project Structure
 
