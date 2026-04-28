@@ -36,18 +36,18 @@ public class LogMapper extends Mapper<LongWritable, Text, Text, Text> {
         }
 
         LogRecord record = optRecord.get();
-        int batchId = context.getConfiguration().getInt("mapreduce.task.partition", 0);
+//        int batchId = context.getConfiguration().getInt("mapreduce.task.partition", 0);
 
         if ("daily_traffic".equals(queryName)) {
-            outKey.set(batchId + "|" + record.getLogDate() + "|" + record.getStatusCode());
+            outKey.set(record.getLogDate() + "|" + record.getStatusCode());
             outValue.set(String.valueOf(record.getBytes()));
             context.write(outKey, outValue);
         } else if ("top_resources".equals(queryName)) {
-            outKey.set(batchId + "|" + record.getResourcePath());
+            outKey.set(record.getResourcePath());
             outValue.set(record.getHost() + "|" + record.getBytes());
             context.write(outKey, outValue);
         } else if ("hourly_errors".equals(queryName)) {
-            outKey.set(batchId + "|" + record.getLogDate() + "|" + record.getLogHour());
+            outKey.set(record.getLogDate() + "|" + record.getLogHour());
             outValue.set(record.getStatusCode() + "|" + record.getHost());
             context.write(outKey, outValue);
         }

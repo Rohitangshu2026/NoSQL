@@ -18,12 +18,14 @@ import java.sql.Date;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.time.Instant;
 import java.util.stream.Collectors;
 
 public class MapReducePipeline implements Pipeline {
 
     @Override
     public PipelineResult execute(ETLConfig config) throws Exception {
+        Instant startedAt = Instant.now();
         long startTime = System.currentTimeMillis();
         long totalRecords = 0;
         long malformedCount = 0;
@@ -60,7 +62,7 @@ public class MapReducePipeline implements Pipeline {
                 totalRecords = job.getCounters().findCounter(LogMapper.Counters.TOTAL_RECORDS).getValue();
                 malformedCount = job.getCounters().findCounter(LogMapper.Counters.MALFORMED_RECORDS).getValue();
             }
-            
+
             // MapReduce doesn't strictly provide a built-in count of total distinct input splits across all jobs easily in a variable,
             // but the number of maps is generally the number of batches.
             int batches = job.getConfiguration().getInt("mapreduce.job.maps", 1);
@@ -75,7 +77,7 @@ public class MapReducePipeline implements Pipeline {
         rows = postProcessTopResources(rows);
 
         long runtimeMs = System.currentTimeMillis() - startTime;
-        return new PipelineResult(totalRecords, maxBatches, malformedCount, runtimeMs, null, null, rows);
+        return new PipelineResult(totalRecords, maxBatches, malformedCount, runtimeMs, startedAt, Instant.now(), rows);
     }
 
     private List<ResultRow> readResults(Configuration conf, Path outPath, String queryName) throws Exception {
@@ -92,25 +94,25 @@ public class MapReducePipeline implements Pipeline {
                         String[] parts = line.split("\\t");
                         String keyPart = parts[0];
                         String[] keyTokens = keyPart.split("\\|");
-                        int batchId = Integer.parseInt(keyTokens[0]);
+                        int batchId = 1;
 
                         ResultRow row = new ResultRow(batchId, queryName);
 
                         if ("daily_traffic".equals(queryName)) {
-                            row.setLogDate(Date.valueOf(keyTokens[1]));
-                            row.setStatusCode(Integer.parseInt(keyTokens[2]));
+                            row.setLogDate(Date.valueOf(keyTokens[0]));
+                            row.setStatusCode(Integer.parseInt(keyTokens[1]));
                             row.setRequestCount(Long.parseLong(parts[1]));
                             row.setTotalBytes(Long.parseLong(parts[2]));
 
                         } else if ("top_resources".equals(queryName)) {
-                            row.setResourcePath(keyTokens[1]);
+                            row.setResourcePath(keyTokens[0]);
                             row.setRequestCount(Long.parseLong(parts[1]));
                             row.setTotalBytes(Long.parseLong(parts[2]));
                             row.setDistinctHosts(Integer.parseInt(parts[3]));
 
                         } else if ("hourly_errors".equals(queryName)) {
-                            row.setLogDate(Date.valueOf(keyTokens[1]));
-                            row.setLogHour(Integer.parseInt(keyTokens[2]));
+                            row.setLogDate(Date.valueOf(keyTokens[0]));
+                            row.setLogHour(Integer.parseInt(keyTokens[1]));
                             row.setErrorRequestCount(Integer.parseInt(parts[1]));
                             row.setTotalRequestCount(Integer.parseInt(parts[2]));
                             row.setErrorRate(Double.parseDouble(parts[3]));
@@ -126,7 +128,7 @@ public class MapReducePipeline implements Pipeline {
 
     private List<ResultRow> postProcessTopResources(List<ResultRow> allRows) {
         List<ResultRow> finalRows = new ArrayList<>();
-        
+
         List<ResultRow> topResRows = new ArrayList<>();
         for (ResultRow r : allRows) {
             if ("top_resources".equals(r.getQueryName())) {
@@ -136,12 +138,8 @@ public class MapReducePipeline implements Pipeline {
             }
         }
 
-        topResRows.stream()
-                .collect(Collectors.groupingBy(ResultRow::getBatchId))
-                .forEach((batchId, list) -> {
-                    list.sort(Comparator.comparing(ResultRow::getRequestCount).reversed());
-                    finalRows.addAll(list.stream().limit(20).collect(Collectors.toList()));
-                });
+        topResRows.sort(Comparator.comparing(ResultRow::getRequestCount).reversed());
+        finalRows.addAll(topResRows.stream().limit(20).collect(Collectors.toList()));
 
         return finalRows;
     }
