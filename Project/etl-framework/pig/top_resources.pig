@@ -16,6 +16,5 @@ resources = FOREACH grouped {
         SUM(flattened.bytes) AS total_bytes,
         COUNT(unique_hosts) AS distinct_hosts;
 };
-ordered = ORDER resources BY request_count DESC;
-top20 = LIMIT ordered 20;
-STORE top20 INTO '$OUTPUT' USING PigStorage('\t');
+
+STORE top_resources INTO '$OUTPUT' USING PigStorage('\t');

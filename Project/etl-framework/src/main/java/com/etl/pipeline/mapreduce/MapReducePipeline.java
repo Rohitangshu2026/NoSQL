@@ -75,7 +75,7 @@ public class MapReducePipeline implements Pipeline {
         rows = postProcessTopResources(rows);
 
         long runtimeMs = System.currentTimeMillis() - startTime;
-        return new PipelineResult(totalRecords, maxBatches, malformedCount, runtimeMs, rows);
+        return new PipelineResult(totalRecords, maxBatches, malformedCount, runtimeMs, null, null, rows);
     }
 
     private List<ResultRow> readResults(Configuration conf, Path outPath, String queryName) throws Exception {

@@ -32,6 +32,12 @@
             <version>${pig.version}</version>
         </dependency>
 
+        <dependency>
+            <groupId>org.python</groupId>
+            <artifactId>jython-standalone</artifactId>
+            <version>2.7.2</version>
+        </dependency>
+
         <!-- MySQL Connector -->
         <dependency>
             <groupId>mysql</groupId>
