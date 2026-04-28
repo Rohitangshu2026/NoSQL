@@ -154,16 +154,16 @@ F --> P2[Run Script: top_resources.pig]
 F --> P3[Run Script: hourly_errors.pig]
 
 %% Execution Layer
-Q1 --> R1[MapReduce Job → Global Aggregation]
-Q2 --> R2[MapReduce Job → Global Aggregation]
-Q3 --> R3[MapReduce Job → Global Aggregation]
+Q1 --> R1[MapReduce Job - Global Aggregation]
+Q2 --> R2[MapReduce Job - Global Aggregation]
+Q3 --> R3[MapReduce Job - Global Aggregation]
 
-P1 --> S1[Pig Script → Global Aggregation]
-P2 --> S2[Pig Script → Global Aggregation]
-P3 --> S3[Pig Script → Global Aggregation]
+P1 --> S1[Pig Script - Global Aggregation]
+P2 --> S2[Pig Script - Global Aggregation]
+P3 --> S3[Pig Script - Global Aggregation]
 
 %% Collect results
-R1 --> T[Read outputs → List<ResultRow>]
+R1 --> T[Read outputs - List ResultRow]
 R2 --> T
 R3 --> T
 
@@ -172,13 +172,13 @@ S2 --> T
 S3 --> T
 
 %% Post-processing
-T --> U[Post-process (Top 20 resources globally)]
+T --> U[Post-process: Top 20 resources globally]
 
 %% Load
-U --> V[ResultLoader: Insert into etl_runs + etl_results]
+U --> V[ResultLoader: Insert into etl_runs and etl_results]
 
 %% Reporting
-V --> W[Reporter: Print metadata + final query results]
+V --> W[Reporter: Print metadata and final query results]
 
 W --> X[End]
 ```
