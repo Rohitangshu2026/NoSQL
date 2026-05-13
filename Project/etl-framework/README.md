@@ -194,9 +194,9 @@ B --> C["Generate UUID run_id"]
 C --> D{"Select Pipeline"}
 
 D -->|mapreduce| MR["MapReducePipeline"]
-D -->|pig|       PG["PigPipeline"]
-D -->|mongodb|   MG["MongoDBPipeline"]
-D -->|hive|      HV["HivePipeline"]
+D -->|pig| PG["PigPipeline"]
+D -->|mongodb| MG["MongoDBPipeline"]
+D -->|hive| HV["HivePipeline"]
 
 MR --> BS1["BatchSplitter.split<br/>writes batch-NNNNN.log"]
 PG --> BS2["BatchSplitter.split<br/>writes batch-NNNNN.log"]
