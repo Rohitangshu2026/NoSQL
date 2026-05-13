@@ -1,6 +1,8 @@
 # NASA Log ETL Framework
 
-A multi-pipeline ETL and reporting framework for NASA HTTP web server log analytics. The framework supports pluggable execution backends — MapReduce and Apache Pig are fully implemented — to parse, aggregate, and store insights from raw web server logs into a relational MySQL database.
+A multi-pipeline ETL and reporting framework for NASA HTTP web server log analytics. The framework supports four pluggable execution backends — **MapReduce**, **Apache Pig**, **MongoDB**, and **Apache Hive** — that parse, aggregate, and store insights from raw web server logs into a relational MySQL database.
+
+The user picks the execution backend, the query (`q1`, `q2`, `q3`, or `all`), and the batch size at the CLI. The ETL logic, parsing rules, batching logic, and reporting layer are identical across all four pipelines so the comparison is fair.
 
 ---
 
@@ -297,6 +299,8 @@ Loader-->>Runner: success
 - Maven 3.6+
 - Hadoop 3.3.6 (local mode works — no HDFS cluster required for development)
 - MySQL 8+ with a database named `etldb`
+- **MongoDB 5+** (only required for the MongoDB pipeline) — listening on `mongodb://localhost:27017` by default
+- **HiveServer2** running and reachable at `jdbc:hive2://localhost:10000/default` (only required for the Hive pipeline)
 
 ---
 
@@ -384,10 +388,41 @@ hadoop jar target/etl-framework-1.0.jar com.etl.ETLRunner \
 |---|---|---|---|
 | `--pipeline` | yes | — | `mapreduce`, `pig`, `mongodb`, `hive` |
 | `--input` | yes | — | Input path (`file:///` or `hdfs:///`) |
-| `--batch-size` | no | 1000 | Records per batch |
-| `--db-url` | yes | — | JDBC connection URL |
+| `--batch-size` | no | 50000 | Records per batch |
+| `--query` | no | `all` | `q1` / `q2` / `q3` / `daily_traffic` / `top_resources` / `hourly_errors` / `all` |
+| `--db-url` | yes | — | MySQL JDBC connection URL |
 | `--db-user` | yes | — | MySQL username |
 | `--db-pass` | yes | — | MySQL password |
+| `--mongo-uri` | no | `mongodb://localhost:27017` | MongoDB connection string |
+| `--mongo-db` | no | `etl_logs` | MongoDB database name to write the per-run collection into |
+| `--hive-url` | no | `jdbc:hive2://localhost:10000/default` | HiveServer2 JDBC URL |
+| `--hive-user` | no | empty | HiveServer2 username (if auth is enabled) |
+| `--hive-pass` | no | empty | HiveServer2 password (if auth is enabled) |
+
+If `--pipeline` is omitted in an interactive terminal, the CLI prompts the user to choose one of the four backends.
+
+### Pipeline-specific examples
+
+```bash
+# MongoDB — runs the full ETL + aggregation against a local mongod
+./scripts/run.sh \
+  --pipeline mongodb \
+  --input file:///path/to/NASA_access_log_Jul95 \
+  --batch-size 50000
+
+# Hive — runs HiveQL aggregations against a local HiveServer2
+./scripts/run.sh \
+  --pipeline hive \
+  --input file:///path/to/NASA_access_log_Jul95 \
+  --batch-size 50000 \
+  --hive-url jdbc:hive2://localhost:10000/default
+
+# Run only Query 2 (Top Resources) through MapReduce
+./scripts/run.sh \
+  --pipeline mapreduce \
+  --input file:///path/to/NASA_access_log_Jul95 \
+  --query q2
+```
 
 ---
 
@@ -516,15 +551,31 @@ etl-framework/
     │   ├── pig/
     │   │   ├── PigPipeline.java
     │   │   └── LogParserUDF.java
-    │   ├── mongodb/MongoDBPipeline.java   ← Phase 2
-    │   └── hive/HivePipeline.java        ← Phase 2
+    │   ├── mongodb/MongoDBPipeline.java
+    │   └── hive/HivePipeline.java
     └── report/Reporter.java
 ```
 
 ---
 
+## Pipeline Equivalence
+
+All four pipelines implement the same logical ETL steps and produce the same result schema:
+
+| Stage | MapReduce | Pig | MongoDB | Hive |
+|---|---|---|---|---|
+| Raw input | NCSA log lines (local FS / HDFS) | NCSA log lines | NCSA log lines | NCSA log lines |
+| Parsing | `LogMapper` calls `LogParser` | `LogParserUDF` calls `LogParser` | Java `LogParser` before `insertMany` | Java `LogParser` while writing TSV batch files |
+| Batching | Hadoop input splits | TSV batch files of `batchSize` lines | `insertMany` chunks of `batchSize` documents | TSV batch files of `batchSize` lines |
+| Aggregation | MR jobs (`LogMapper` + `QueryReducer`) | Pig Latin scripts under `pig/*.pig` | MongoDB aggregation framework (`$group`, `$sort`, `$limit`) | HiveQL `GROUP BY` queries through HiveServer2 JDBC |
+| Result load | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL |
+| Reporting | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL |
+
+The CLI, `LogParser`, `ResultRow` schema, `ResultLoader`, and `Reporter` are reused unchanged across every pipeline.
+
 ## Known Limitations (Local Mode)
 
-- **`batch_id` is always 0** in Hadoop local mode because `mapreduce.task.partition` returns 0 for all tasks. In cluster mode with real HDFS splits, each split receives a distinct partition index. This is a local-mode constraint, not a logic error.
-- **Pig `malformed_count` is not tracked** — Pig does not expose a Hadoop Counter equivalent without a custom accumulator UDF. The value is stored as 0 in `etl_runs`.
-- **MongoDB and Hive pipelines** throw `UnsupportedOperationException` and are planned for Phase 2.
+- **`batch_id` is always 1** in result rows because every pipeline produces a single set of *global* aggregates per query. The number of ingestion batches is stored in `etl_runs.total_batches`, and the average batch size in the reporting output.
+- **Pig `malformed_count` is exact** — it is now computed in Java during batch preparation (`prepareBatches`) before Pig runs, since Pig does not expose a counter equivalent.
+- **Hive pipeline** requires HiveServer2 to be running. The fat-jar bundles `hive-jdbc:3.1.3` so no client-side install of Hive is needed beyond the running server.
+- **MongoDB pipeline** uses one temporary collection per run (`etl_logs_<runId-hex>` inside the `etl_logs` database) and drops it on completion.
