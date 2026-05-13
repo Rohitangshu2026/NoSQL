@@ -189,43 +189,37 @@ Reporter     ..> ResultRow : (via MySQL)
 ```mermaid
 flowchart TD
 
-A[Start ETLRunner] --> B[Parse CLI args & build ETLConfig]
-B --> C[Generate UUID run_id]
-C --> D{Select Pipeline}
+A["Start ETLRunner"] --> B["Parse CLI args and build ETLConfig"]
+B --> C["Generate UUID run_id"]
+C --> D{"Select Pipeline"}
 
-D -->|mapreduce| MR[MapReducePipeline]
-D -->|pig|       PG[PigPipeline]
-D -->|mongodb|   MG[MongoDBPipeline]
-D -->|hive|      HV[HivePipeline]
+D -->|mapreduce| MR["MapReducePipeline"]
+D -->|pig|       PG["PigPipeline"]
+D -->|mongodb|   MG["MongoDBPipeline"]
+D -->|hive|      HV["HivePipeline"]
 
-%% --- batching layer ------------------------------------------------------
-MR --> BS1[BatchSplitter.split → batch-NNNNN.log]
-PG --> BS2[BatchSplitter.split → batch-NNNNN.log]
-MG --> BS3[batched insertMany → docs tagged with batch_id]
-HV --> BS4[prepareBatches → batch-NNNNN.tsv with batch_id col]
+MR --> BS1["BatchSplitter.split<br/>writes batch-NNNNN.log"]
+PG --> BS2["BatchSplitter.split<br/>writes batch-NNNNN.log"]
+MG --> BS3["batched insertMany<br/>docs tagged with batch_id"]
+HV --> BS4["prepareBatches<br/>writes batch-NNNNN.tsv<br/>batch_id is column 0"]
 
-%% --- aggregation layer ---------------------------------------------------
-BS1 --> EX1[MR job per query<br/>key prefixed with batch_id]
-BS2 --> EX2[Pig script per batch × per query]
-BS3 --> EX3[Mongo aggregation:<br/>group by batch_id, ...]
-BS4 --> EX4[HiveQL:<br/>GROUP BY batch_id, ...]
+BS1 --> EX1["MR job per query<br/>reducer key prefixed with batch_id"]
+BS2 --> EX2["Pig script per batch per query"]
+BS3 --> EX3["Mongo aggregation<br/>group by batch_id and key"]
+BS4 --> EX4["HiveQL GROUP BY<br/>batch_id and key"]
 
-%% --- collect ResultRows --------------------------------------------------
-EX1 --> RR[List&lt;ResultRow&gt;<br/>each tagged with batch_id]
+EX1 --> RR["List of ResultRow<br/>each tagged with batch_id"]
 EX2 --> RR
 EX3 --> RR
 EX4 --> RR
 
-%% --- query filter and top-20 per batch ------------------------------------
-RR --> PP[Post-process:<br/>keep top 20 per batch for Q2<br/>filter to selected query]
+RR --> PP["Post-process<br/>top 20 per batch for Q2<br/>filter to selected query"]
 
-%% --- load layer ----------------------------------------------------------
-PP --> LD[ResultLoader:<br/>etl_runs + etl_batches + etl_results]
+PP --> LD["ResultLoader writes<br/>etl_runs and etl_batches and etl_results"]
 
-%% --- report layer --------------------------------------------------------
-LD --> RP[Reporter reads MySQL:<br/>Run Summary → Batch Summary →<br/>Per-Batch Results → Global Rollup]
+LD --> RP["Reporter reads MySQL<br/>Run Summary then Batch Summary<br/>then Per-Batch Results then Global Rollup"]
 
-RP --> END[End]
+RP --> ENDN["End"]
 ```
 
 ### MapReduce Pipeline — Sequence
@@ -332,42 +326,42 @@ participant DB as MySQL
 Runner->>Mongo: execute(config)
 
 Mongo->>DR: MongoClients.create(mongoUri)
-Mongo->>Coll: drop() + createIndex(batch_id, log_date, status_code, ...)
+Mongo->>Coll: drop and createIndex on batch_id and keys
 
 rect rgb(240, 248, 255)
-Note over Mongo,Coll: ETL — parse + batched insertMany
+Note over Mongo,Coll: ETL phase — parse and batched insertMany
 
-loop stream raw NCSA log lines
+loop for every raw NCSA log line
     Mongo->>LP: parse(line)
-    LP-->>Mongo: Optional[LogRecord]
+    LP-->>Mongo: parsed LogRecord or empty
     Mongo->>Mongo: tag doc with current batch_id, append to buffer
-    alt buffer.size() == batchSize
+    alt buffer is full
         Mongo->>Coll: insertMany(buffer)
         Coll-->>Mongo: ack
-        Mongo->>Mongo: batchCount++ ; reset counters
+        Mongo->>Mongo: increment batch count, reset buffer
     end
 end
 Mongo->>Coll: flush final partial buffer
 end
 
 rect rgb(248, 248, 235)
-Note over Mongo,Coll: For each selected query — aggregation pipeline
+Note over Mongo,Coll: Aggregation phase — one pipeline per selected query
 
 alt Q1 daily_traffic
-    Mongo->>Coll: aggregate([ $group _id:{batch_id,log_date,status_code}, $sort ])
+    Mongo->>Coll: group on batch_id and log_date and status_code,<br/>sum count and sum bytes
 end
-alt Q2 top_resources (top 20 per batch)
-    Mongo->>Coll: aggregate([ $group _id:{batch_id,resource_path},<br/>$project distinct_hosts:$size,<br/>$sort batch_id+count desc,<br/>$group _id:batch_id, top:$push,<br/>$project top:$slice 20 ])
+alt Q2 top_resources, top 20 per batch
+    Mongo->>Coll: group on batch_id and resource_path,<br/>then sort and push into per-batch arrays,<br/>then slice 20
 end
 alt Q3 hourly_errors
-    Mongo->>Coll: aggregate([ $group _id:{batch_id,log_date,log_hour},<br/>error counts + $$REMOVE'd error_hosts,<br/>$project error_rate=$divide ])
+    Mongo->>Coll: group on batch_id and log_date and log_hour,<br/>count errors with cond, divide for error rate,<br/>addToSet of host gated on the error cond
 end
-Coll-->>Mongo: cursor over per-(batch_id, key) documents
+Coll-->>Mongo: cursor over per batch and key documents
 end
 
-Mongo->>Coll: drop()  (finally)
+Mongo->>Coll: drop in finally
 
-Mongo-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
+Mongo-->>Runner: PipelineResult with rows and per-batch metadata
 
 Runner->>Loader: load(config, result)
 Loader->>DB: INSERT etl_runs
@@ -410,18 +404,18 @@ Hive->>HS2: DROP TABLE IF EXISTS etl_logs_runIdHex
 Hive->>HS2: CREATE EXTERNAL TABLE ... LOCATION '/tmp/.../batches/'
 
 rect rgb(248, 248, 235)
-Note over Hive,HS2: For each selected query — HiveQL aggregation
+Note over Hive,HS2: Aggregation phase — HiveQL per selected query
 
 alt Q1 daily_traffic
-    Hive->>HS2: SELECT batch_id, log_date, status_code,<br/>COUNT(*), SUM(bytes)<br/>GROUP BY batch_id, log_date, status_code
+    Hive->>HS2: GROUP BY batch_id, log_date, status_code<br/>with COUNT and SUM of bytes
 end
-alt Q2 top_resources (top 20 per batch)
-    Hive->>HS2: SELECT ... FROM (<br/>  SELECT batch_id, resource_path, COUNT(*), SUM(bytes), COUNT(DISTINCT host),<br/>         ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY COUNT(*) DESC) AS rn<br/>  ...<br/>) WHERE rn <= 20
+alt Q2 top_resources, top 20 per batch
+    Hive->>HS2: inner GROUP BY batch_id and resource_path<br/>with ROW_NUMBER OVER PARTITION BY batch_id,<br/>outer query keeps rn up to 20
 end
 alt Q3 hourly_errors
-    Hive->>HS2: SELECT batch_id, log_date, log_hour,<br/>SUM(CASE WHEN status BETWEEN 400 AND 599 ...),<br/>COUNT(*), error_rate, COUNT(DISTINCT host)<br/>GROUP BY batch_id, log_date, log_hour
+    Hive->>HS2: GROUP BY batch_id, log_date, log_hour<br/>with CASE WHEN status BETWEEN 400 AND 599<br/>plus COUNT DISTINCT host gated on the same CASE
 end
-HS2-->>Hive: ResultSet streaming per-(batch_id, key) rows
+HS2-->>Hive: ResultSet streaming per batch and key rows
 end
 
 Hive->>HS2: DROP TABLE etl_logs_runIdHex  (finally)
