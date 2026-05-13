@@ -106,6 +106,12 @@
                                     </excludes>
                                 </filter>
                             </filters>
+                            <transformers>
+                                <!-- Merge META-INF/services/* so Hadoop's
+                                     LocalClientProtocolProvider and Mongo/Hive
+                                     SPI bindings survive the shade. -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
                         </configuration>
                     </execution>
                 </executions>
