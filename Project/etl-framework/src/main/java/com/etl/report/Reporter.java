@@ -20,9 +20,11 @@ public class Reporter {
     public static void printReport(ETLConfig config, PipelineResult result) throws Exception {
         try (Connection conn = openConnection(config)) {
             printRunSummary(conn, config);
-            printQueryResults(conn, config, "daily_traffic");
-            printQueryResults(conn, config, "top_resources");
-            printQueryResults(conn, config, "hourly_errors");
+            for (String q : new String[]{"daily_traffic", "top_resources", "hourly_errors"}) {
+                if (config.runsQuery(q)) {
+                    printQueryResults(conn, config, q);
+                }
+            }
         }
     }
 

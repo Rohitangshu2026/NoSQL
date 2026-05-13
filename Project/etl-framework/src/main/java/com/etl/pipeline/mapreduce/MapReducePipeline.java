@@ -35,6 +35,7 @@ public class MapReducePipeline implements Pipeline {
         String[] queries = {"daily_traffic", "top_resources", "hourly_errors"};
 
         for (String query : queries) {
+            if (!config.runsQuery(query)) continue;
             Configuration conf = new Configuration();
             conf.set("etl.query.name", query);
 
@@ -58,7 +59,9 @@ public class MapReducePipeline implements Pipeline {
                 throw new Exception("Job " + query + " failed.");
             }
 
-            if (query.equals("daily_traffic")) {
+            // Counter values are the same across all three queries (same input, same mapper).
+            // Capture them once from whichever query ran first.
+            if (totalRecords == 0) {
                 totalRecords = job.getCounters().findCounter(LogMapper.Counters.TOTAL_RECORDS).getValue();
                 malformedCount = job.getCounters().findCounter(LogMapper.Counters.MALFORMED_RECORDS).getValue();
             }

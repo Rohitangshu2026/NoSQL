@@ -74,7 +74,9 @@ public class PigPipeline implements Pipeline {
         long malformedCount = batchPrep.malformedRecords;
         List<ResultRow> rows = new ArrayList<>();
 
-        String[] queries = {"daily_traffic", "top_resources", "hourly_errors"};
+        String[] allQueries = {"daily_traffic", "top_resources", "hourly_errors"};
+        List<String> queries = new ArrayList<>();
+        for (String q : allQueries) if (config.runsQuery(q)) queries.add(q);
 
         // FIX 4 — A single PigServer accumulates alias state across registerScript() calls.
         // When top_resources.pig runs after daily_traffic.pig on the same instance,
