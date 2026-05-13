@@ -16,6 +16,7 @@ The framework has three layers: a **controller layer** that owns the CLI, run ID
 
 ```mermaid
 classDiagram
+direction LR
 
 class ETLRunner {
     +main(String[] args)
@@ -31,19 +32,30 @@ class Pipeline {
 }
 
 class MapReducePipeline {
-    +execute(ETLConfig config) PipelineResult
+    -readResults()
+    -postProcessTopResources()
+    +execute(ETLConfig) PipelineResult
 }
 
 class PigPipeline {
-    +execute(ETLConfig config) PipelineResult
+    -readResults()
+    -postProcessTopResources()
+    +execute(ETLConfig) PipelineResult
 }
 
 class MongoDBPipeline {
-    +execute(ETLConfig config) PipelineResult
+    -runDailyTraffic(coll)
+    -runTopResources(coll)
+    -runHourlyErrors(coll)
+    +execute(ETLConfig) PipelineResult
 }
 
 class HivePipeline {
-    +execute(ETLConfig config) PipelineResult
+    -prepareBatches()
+    -runDailyTraffic(stmt)
+    -runTopResources(stmt)
+    -runHourlyErrors(stmt)
+    +execute(ETLConfig) PipelineResult
 }
 
 class ETLConfig {
@@ -51,9 +63,16 @@ class ETLConfig {
     -String inputPath
     -int batchSize
     -UUID runId
+    -String selectedQuery
     -String dbUrl
     -String dbUser
     -String dbPassword
+    -String mongoUri
+    -String mongoDatabase
+    -String hiveJdbcUrl
+    -String hiveUser
+    -String hivePassword
+    +runsQuery(String) boolean
 }
 
 class PipelineResult {
@@ -61,7 +80,11 @@ class PipelineResult {
     -int totalBatches
     -long malformedCount
     -long runtimeMs
+    -Instant startedAt
+    -Instant finishedAt
     -List~ResultRow~ rows
+    -Map~Integer,Integer~ recordsPerBatch
+    -Map~Integer,Integer~ malformedPerBatch
     +avgBatchSize() double
 }
 
@@ -81,6 +104,12 @@ class ResultRow {
     -Integer distinctErrorHosts
 }
 
+class BatchSplitter {
+    <<utility>>
+    +split(inputPath, batchSize, batchDir, conf) Result
+    +batchIdFromFilename(String) int
+}
+
 class LogParser {
     +parse(String line) Optional~LogRecord~
 }
@@ -96,16 +125,28 @@ class LogRecord {
     +long bytes
 }
 
+class LogMapper {
+    -int batchId
+    +setup(Context)
+    +map(key, value, Context)
+}
+
+class QueryReducer {
+    +reduce(key, values, Context)
+}
+
+class LogParserUDF {
+    +exec(Tuple) Tuple
+}
+
 class ResultLoader {
     +load(ETLConfig, PipelineResult)
+    +updateExecutionMetadata(ETLConfig, Timestamp, long)
 }
 
 class Reporter {
     +printReport(ETLConfig, PipelineResult)
 }
-
-class LogMapper
-class QueryReducer
 
 %% Relationships
 
@@ -124,13 +165,23 @@ Pipeline <|.. HivePipeline
 Pipeline ..> PipelineResult : returns
 PipelineResult "1" *-- "*" ResultRow : contains
 
-%% Parsing flow
-LogMapper --> LogParser : uses
-LogParser --> LogRecord : produces
+MapReducePipeline --> BatchSplitter : prepares batches
+PigPipeline       --> BatchSplitter : prepares batches
+MongoDBPipeline   --> LogParser     : parses in-process
+HivePipeline      --> LogParser     : parses while writing TSV
 
-%% MapReduce internals
 MapReducePipeline --> LogMapper
 MapReducePipeline --> QueryReducer
+LogMapper         --> LogParser
+LogMapper         --> BatchSplitter : reads batch_id from filename
+
+PigPipeline       --> LogParserUDF
+LogParserUDF      --> LogParser
+
+LogParser --> LogRecord : produces
+
+ResultLoader --> ResultRow : reads
+Reporter     ..> ResultRow : (via MySQL)
 ```
 
 ### Execution Flow
@@ -138,53 +189,43 @@ MapReducePipeline --> QueryReducer
 ```mermaid
 flowchart TD
 
-A[Start ETLRunner] --> B[Parse CLI Arguments]
-B --> C[Generate UUID run_id / Build ETLConfig]
-
+A[Start ETLRunner] --> B[Parse CLI args & build ETLConfig]
+B --> C[Generate UUID run_id]
 C --> D{Select Pipeline}
 
-D -->|mapreduce| E[MapReducePipeline]
-D -->|pig| F[PigPipeline]
-D -->|mongodb| G[MongoDBPipeline stub]
-D -->|hive| H[HivePipeline stub]
+D -->|mapreduce| MR[MapReducePipeline]
+D -->|pig|       PG[PigPipeline]
+D -->|mongodb|   MG[MongoDBPipeline]
+D -->|hive|      HV[HivePipeline]
 
-%% Query Fanout
-E --> Q1[Run Query: daily_traffic]
-E --> Q2[Run Query: top_resources]
-E --> Q3[Run Query: hourly_errors]
+%% --- batching layer ------------------------------------------------------
+MR --> BS1[BatchSplitter.split → batch-NNNNN.log]
+PG --> BS2[BatchSplitter.split → batch-NNNNN.log]
+MG --> BS3[batched insertMany → docs tagged with batch_id]
+HV --> BS4[prepareBatches → batch-NNNNN.tsv with batch_id col]
 
-F --> P1[Run Script: daily_traffic.pig]
-F --> P2[Run Script: top_resources.pig]
-F --> P3[Run Script: hourly_errors.pig]
+%% --- aggregation layer ---------------------------------------------------
+BS1 --> EX1[MR job per query<br/>key prefixed with batch_id]
+BS2 --> EX2[Pig script per batch × per query]
+BS3 --> EX3[Mongo aggregation:<br/>group by batch_id, ...]
+BS4 --> EX4[HiveQL:<br/>GROUP BY batch_id, ...]
 
-%% Execution Layer
-Q1 --> R1[MapReduce Job - Global Aggregation]
-Q2 --> R2[MapReduce Job - Global Aggregation]
-Q3 --> R3[MapReduce Job - Global Aggregation]
+%% --- collect ResultRows --------------------------------------------------
+EX1 --> RR[List&lt;ResultRow&gt;<br/>each tagged with batch_id]
+EX2 --> RR
+EX3 --> RR
+EX4 --> RR
 
-P1 --> S1[Pig Script - Global Aggregation]
-P2 --> S2[Pig Script - Global Aggregation]
-P3 --> S3[Pig Script - Global Aggregation]
+%% --- query filter and top-20 per batch ------------------------------------
+RR --> PP[Post-process:<br/>keep top 20 per batch for Q2<br/>filter to selected query]
 
-%% Collect results
-R1 --> T[Read outputs - List ResultRow]
-R2 --> T
-R3 --> T
+%% --- load layer ----------------------------------------------------------
+PP --> LD[ResultLoader:<br/>etl_runs + etl_batches + etl_results]
 
-S1 --> T
-S2 --> T
-S3 --> T
+%% --- report layer --------------------------------------------------------
+LD --> RP[Reporter reads MySQL:<br/>Run Summary → Batch Summary →<br/>Per-Batch Results → Global Rollup]
 
-%% Post-processing
-T --> U[Post-process: Top 20 resources globally]
-
-%% Load
-U --> V[ResultLoader: Insert into etl_runs and etl_results]
-
-%% Reporting
-V --> W[Reporter: Print metadata and final query results]
-
-W --> X[End]
+RP --> END[End]
 ```
 
 ### MapReduce Pipeline — Sequence
@@ -194,39 +235,42 @@ sequenceDiagram
 
 participant Runner as ETLRunner
 participant MR as MapReducePipeline
+participant BS as BatchSplitter
 participant FS as FileSystem (local/HDFS)
+participant Hadoop as Hadoop LocalJobRunner
 participant Loader as ResultLoader
 participant DB as MySQL
 
 Runner->>MR: execute(config)
 
+MR->>BS: split(input, batchSize, /tmp/etl_mr_batches/runId)
+BS->>FS: write batch-00001.log ... batch-NNNNN.log<br/>(also counts records & malformed per batch)
+BS-->>MR: Result{ batchFiles, recordsPerBatch, malformedPerBatch }
+
 rect rgb(240, 248, 255)
-Note over MR,FS: Execute 3 queries (global aggregation)
+Note over MR,Hadoop: For each selected query in {daily_traffic, top_resources, hourly_errors}
 
-MR->>FS: Job 1 — daily_traffic\n(LogMapper → QueryReducer)
-FS-->>MR: part-r-00000
-
-MR->>FS: Job 2 — top_resources\n(LogMapper → QueryReducer)
-FS-->>MR: part-r-00000
-
-MR->>FS: Job 3 — hourly_errors\n(LogMapper → QueryReducer)
-FS-->>MR: part-r-00000
+MR->>Hadoop: Job(query)<br/>FileInputFormat = batchDir
+Hadoop->>Hadoop: LogMapper.setup() →<br/>FileSplit.getPath().getName() → batch_id
+Hadoop->>Hadoop: map() emits<br/>(batch_id|key) → value
+Hadoop->>Hadoop: QueryReducer aggregates<br/>per (batch_id, group key)
+Hadoop->>FS: write part-r-NNNNN
+FS-->>MR: part-r-NNNNN
+MR->>MR: readResults() → ResultRows tagged with batch_id
 end
 
-MR->>MR: readResults()\n(parse tab-separated output)
+MR->>MR: postProcessTopResources()<br/>(top 20 per batch_id)
 
-MR->>MR: postProcessTopResources()\n(keep top 20 globally)
-
-MR-->>Runner: PipelineResult
+MR-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
 
 Runner->>Loader: load(config, result)
-
 Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_batches
 Loader->>DB: batch INSERT etl_results
-
 DB-->>Loader: commit
 Loader-->>Runner: success
 ```
+
 ### Pig Pipeline — Sequence
 
 ```mermaid
@@ -234,45 +278,191 @@ sequenceDiagram
 
 participant Runner as ETLRunner
 participant Pig as PigPipeline
-participant PS as PigServer
+participant BS as BatchSplitter
 participant FS as FileSystem (local/HDFS)
+participant PS as PigServer (LOCAL)
 participant Loader as ResultLoader
 participant DB as MySQL
 
 Runner->>Pig: execute(config)
 
+Pig->>BS: split(input, batchSize, /tmp/etl_pig_batches/runId)
+BS->>FS: write batch-00001.log ... batch-NNNNN.log
+BS-->>Pig: Result{ batchFiles, recordsPerBatch, malformedPerBatch }
+
 rect rgb(240, 248, 255)
-Note over Pig,PS: Execute 3 queries (global aggregation)
+Note over Pig,PS: For each batch file × each selected query
 
-Pig->>PS: Register Script — daily_traffic.pig\n(params: INPUT, OUTPUT)
-PS->>FS: Load input + execute Pig Latin
-FS-->>PS: output files (part-r-00000)
-PS-->>Pig: script completed
-
-Pig->>PS: Register Script — top_resources.pig\n(params: INPUT, OUTPUT)
-PS->>FS: Load input + execute Pig Latin
-FS-->>PS: output files (part-r-00000)
-PS-->>Pig: script completed
-
-Pig->>PS: Register Script — hourly_errors.pig\n(params: INPUT, OUTPUT)
-PS->>FS: Load input + execute Pig Latin
-FS-->>PS: output files (part-r-00000)
-PS-->>Pig: script completed
+loop over batch-NNNNN.log
+    loop over {daily_traffic, top_resources, hourly_errors}
+        Pig->>PS: new PigServer(LOCAL)<br/>registerScript(query.pig,<br/>INPUT=batch-NNNNN.log,<br/>OUTPUT=.../query/batch-N)
+        PS->>FS: TextLoader → LogParserUDF → GROUP → STORE
+        FS-->>PS: part-* files
+        PS-->>Pig: shutdown
+        Pig->>Pig: readResults() → ResultRows tagged with batch_id=N
+    end
+end
 end
 
-Pig->>Pig: readResults()\n(parse tab-separated output)
+Pig->>Pig: postProcessTopResources()<br/>(top 20 per batch_id)
 
-Pig->>Pig: postProcessTopResources()\n(keep top 20 globally)
-
-Pig-->>Runner: PipelineResult
+Pig-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
 
 Runner->>Loader: load(config, result)
-
 Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_batches
 Loader->>DB: batch INSERT etl_results
-
 DB-->>Loader: commit
 Loader-->>Runner: success
+```
+
+### MongoDB Pipeline — Sequence
+
+```mermaid
+sequenceDiagram
+
+participant Runner as ETLRunner
+participant Mongo as MongoDBPipeline
+participant LP as LogParser
+participant DR as MongoDB driver
+participant Coll as etl_logs_runIdHex
+participant Loader as ResultLoader
+participant DB as MySQL
+
+Runner->>Mongo: execute(config)
+
+Mongo->>DR: MongoClients.create(mongoUri)
+Mongo->>Coll: drop() + createIndex(batch_id, log_date, status_code, ...)
+
+rect rgb(240, 248, 255)
+Note over Mongo,Coll: ETL — parse + batched insertMany
+
+loop stream raw NCSA log lines
+    Mongo->>LP: parse(line)
+    LP-->>Mongo: Optional[LogRecord]
+    Mongo->>Mongo: tag doc with current batch_id, append to buffer
+    alt buffer.size() == batchSize
+        Mongo->>Coll: insertMany(buffer)
+        Coll-->>Mongo: ack
+        Mongo->>Mongo: batchCount++ ; reset counters
+    end
+end
+Mongo->>Coll: flush final partial buffer
+end
+
+rect rgb(248, 248, 235)
+Note over Mongo,Coll: For each selected query — aggregation pipeline
+
+alt Q1 daily_traffic
+    Mongo->>Coll: aggregate([ $group _id:{batch_id,log_date,status_code}, $sort ])
+end
+alt Q2 top_resources (top 20 per batch)
+    Mongo->>Coll: aggregate([ $group _id:{batch_id,resource_path},<br/>$project distinct_hosts:$size,<br/>$sort batch_id+count desc,<br/>$group _id:batch_id, top:$push,<br/>$project top:$slice 20 ])
+end
+alt Q3 hourly_errors
+    Mongo->>Coll: aggregate([ $group _id:{batch_id,log_date,log_hour},<br/>error counts + $$REMOVE'd error_hosts,<br/>$project error_rate=$divide ])
+end
+Coll-->>Mongo: cursor over per-(batch_id, key) documents
+end
+
+Mongo->>Coll: drop()  (finally)
+
+Mongo-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
+
+Runner->>Loader: load(config, result)
+Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_batches
+Loader->>DB: batch INSERT etl_results
+DB-->>Loader: commit
+Loader-->>Runner: success
+```
+
+### Hive Pipeline — Sequence
+
+```mermaid
+sequenceDiagram
+
+participant Runner as ETLRunner
+participant Hive as HivePipeline
+participant LP as LogParser
+participant FS as FileSystem (local)
+participant JDBC as Hive JDBC
+participant HS2 as HiveServer2
+participant Loader as ResultLoader
+participant DB as MySQL
+
+Runner->>Hive: execute(config)
+
+rect rgb(240, 248, 255)
+Note over Hive,FS: prepareBatches — parse + write TSV with batch_id col 0
+
+loop stream raw NCSA log lines
+    Hive->>LP: parse(line)
+    LP-->>Hive: Optional[LogRecord]
+    Hive->>FS: write "batch_id \t host \t log_date \t ... \t bytes" to<br/>/tmp/etl_hive_batches/runId/batch-NNNNN.tsv
+    Hive->>Hive: rotate to batch NNNNN+1 every batchSize lines
+end
+end
+
+Hive->>JDBC: DriverManager.getConnection(hiveJdbcUrl)
+JDBC->>HS2: open session
+Hive->>HS2: DROP TABLE IF EXISTS etl_logs_runIdHex
+Hive->>HS2: CREATE EXTERNAL TABLE ... LOCATION '/tmp/.../batches/'
+
+rect rgb(248, 248, 235)
+Note over Hive,HS2: For each selected query — HiveQL aggregation
+
+alt Q1 daily_traffic
+    Hive->>HS2: SELECT batch_id, log_date, status_code,<br/>COUNT(*), SUM(bytes)<br/>GROUP BY batch_id, log_date, status_code
+end
+alt Q2 top_resources (top 20 per batch)
+    Hive->>HS2: SELECT ... FROM (<br/>  SELECT batch_id, resource_path, COUNT(*), SUM(bytes), COUNT(DISTINCT host),<br/>         ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY COUNT(*) DESC) AS rn<br/>  ...<br/>) WHERE rn <= 20
+end
+alt Q3 hourly_errors
+    Hive->>HS2: SELECT batch_id, log_date, log_hour,<br/>SUM(CASE WHEN status BETWEEN 400 AND 599 ...),<br/>COUNT(*), error_rate, COUNT(DISTINCT host)<br/>GROUP BY batch_id, log_date, log_hour
+end
+HS2-->>Hive: ResultSet streaming per-(batch_id, key) rows
+end
+
+Hive->>HS2: DROP TABLE etl_logs_runIdHex  (finally)
+
+Hive-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
+
+Runner->>Loader: load(config, result)
+Loader->>DB: INSERT etl_runs
+Loader->>DB: batch INSERT etl_batches
+Loader->>DB: batch INSERT etl_results
+DB-->>Loader: commit
+Loader-->>Runner: success
+```
+
+### Reporter — Sequence
+
+```mermaid
+sequenceDiagram
+
+participant Runner as ETLRunner
+participant Rep as Reporter
+participant DB as MySQL
+
+Runner->>Rep: printReport(config, result)
+Rep->>DB: SELECT * FROM etl_runs WHERE run_id=?
+DB-->>Rep: run metadata (pipeline, query, runtime, totals, avg_batch_size)
+Rep->>Rep: print Run Summary
+
+Rep->>DB: SELECT batch_id, records, malformed FROM etl_batches WHERE run_id=? ORDER BY batch_id
+DB-->>Rep: per-batch rows
+Rep->>Rep: print Batch Summary
+
+loop for each selected query
+    Rep->>DB: SELECT ... FROM etl_results WHERE run_id=? AND query_name=? ORDER BY batch_id, ...
+    DB-->>Rep: per-batch result rows
+    Rep->>Rep: print Per-Batch Results
+
+    Rep->>DB: SELECT SUM(...) FROM etl_results WHERE run_id=? AND query_name=? GROUP BY group-key
+    DB-->>Rep: rolled-up rows
+    Rep->>Rep: print Global Rollup (with Q2-approximation caveat)
+end
 ```
 
 ---
@@ -318,24 +508,24 @@ Produces `target/etl-framework-1.0.jar` (fat jar, all dependencies included).
 
 ## Setup
 
-**1. Database credentials**
+**1. MySQL — credentials and schema**
 
 ```bash
 cp config/db.properties.example config/db.properties
-# Edit config/db.properties with your MySQL host, user, and password
-```
+# Edit config/db.properties with your MySQL host / user / password
 
-**2. Create MySQL tables**
-
-```bash
+mysql -u <user> -p -e "CREATE DATABASE IF NOT EXISTS etldb;"
 mysql -u <user> -p etldb < sql/schema.sql
 ```
 
-**3. Prepare input data**
+That creates `etl_runs`, `etl_batches`, and `etl_results` (drops them first if they already exist).
+
+**2. Prepare input data**
 
 ```bash
 gunzip NASA_access_log_Jul95.gz
 gunzip NASA_access_log_Aug95.gz
+mkdir -p nasa/logs && mv NASA_access_log_*95 nasa/logs/
 ```
 
 For local mode the files can stay on the local filesystem. For cluster mode, upload to HDFS:
@@ -346,97 +536,180 @@ hdfs dfs -put NASA_access_log_Jul95 /nasa/logs/
 hdfs dfs -put NASA_access_log_Aug95 /nasa/logs/
 ```
 
+**3. (Optional) MongoDB — for the `mongodb` pipeline**
+
+```bash
+brew services start mongodb-community           # macOS
+# or: sudo systemctl start mongod               # Linux
+
+# Smoke-test:
+mongosh --eval 'db.runCommand({ping:1})'
+```
+
+No collection setup is needed — `MongoDBPipeline` creates a per-run collection `etl_logs_runIdHex` inside the `etl_logs` database and drops it when the run finishes.
+
+**4. (Optional) HiveServer2 — for the `hive` pipeline**
+
+You need a running HiveServer2 reachable at `--hive-url` (default `jdbc:hive2://localhost:10000/default`):
+
+```bash
+# In a Hive 3.x install:
+$HIVE_HOME/bin/schematool -dbType derby -initSchema   # one-time only
+$HIVE_HOME/bin/hiveserver2 &
+
+# Smoke-test (uses the standalone beeline that ships with Hive):
+$HIVE_HOME/bin/beeline -u jdbc:hive2://localhost:10000/default -e 'SHOW DATABASES;'
+```
+
+`HivePipeline` creates an external table over the per-run batch directory under `/tmp/etl_hive_batches/<runId>/` and drops it when the run finishes — so HiveServer2 must be able to read that local path.
+
 ---
 
 ## Run
 
-Use `scripts/run.sh` which injects the JAR path and DB credentials from `config/db.properties` automatically:
+`scripts/run.sh` injects the JAR path and DB credentials from `config/db.properties` automatically, and uses `java -cp $(hadoop classpath)` under the hood (see [Launcher notes](#launcher-notes)). All examples below assume:
 
 ```bash
-# MapReduce — local filesystem
-./scripts/run.sh \
-  --pipeline mapreduce \
-  --input file:///path/to/NASA_access_log_Jul95 \
-  --batch-size 50000
-
-# Pig — local filesystem
-./scripts/run.sh \
-  --pipeline pig \
-  --input file:///path/to/NASA_access_log_Jul95 \
-  --batch-size 50000
-
-# MapReduce — HDFS (cluster mode)
-./scripts/run.sh \
-  --pipeline mapreduce \
-  --input hdfs:///nasa/logs/ \
-  --batch-size 50000
+export INPUT=file://$PWD/nasa/logs/NASA_access_log_Jul95   # or a directory
+export BATCH=50000
 ```
 
-Or invoke the JAR directly:
-
-```bash
-hadoop jar target/etl-framework-1.0.jar com.etl.ETLRunner \
-  --pipeline mapreduce \
-  --input file:///path/to/NASA_access_log_Jul95 \
-  --batch-size 50000 \
-  --db-url jdbc:mysql://localhost:3306/etldb \
-  --db-user etl \
-  --db-pass Etl@12345
-```
-
-**CLI flags:**
+### CLI flags
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
 | `--pipeline` | yes | — | `mapreduce`, `pig`, `mongodb`, `hive` |
-| `--input` | yes | — | Input path (`file:///` or `hdfs:///`) |
+| `--input` | yes | — | Input path (`file:///` or `hdfs:///`); file or directory |
 | `--batch-size` | no | 50000 | Records per batch |
 | `--query` | no | `all` | `q1` / `q2` / `q3` / `daily_traffic` / `top_resources` / `hourly_errors` / `all` |
 | `--db-url` | yes | — | MySQL JDBC connection URL |
 | `--db-user` | yes | — | MySQL username |
 | `--db-pass` | yes | — | MySQL password |
 | `--mongo-uri` | no | `mongodb://localhost:27017` | MongoDB connection string |
-| `--mongo-db` | no | `etl_logs` | MongoDB database name to write the per-run collection into |
+| `--mongo-db` | no | `etl_logs` | MongoDB database for the per-run collection |
 | `--hive-url` | no | `jdbc:hive2://localhost:10000/default` | HiveServer2 JDBC URL |
 | `--hive-user` | no | empty | HiveServer2 username (if auth is enabled) |
 | `--hive-pass` | no | empty | HiveServer2 password (if auth is enabled) |
 
-If `--pipeline` is omitted in an interactive terminal, the CLI prompts the user to choose one of the four backends.
+If `--pipeline` is omitted in an interactive terminal, the CLI prompts for one of the four backends.
 
-### Pipeline-specific examples
+### Run every query × every pipeline
+
+The 12 combinations from the evaluation spec (3 queries × 4 pipelines):
 
 ```bash
-# MongoDB — runs the full ETL + aggregation against a local mongod
-./scripts/run.sh \
-  --pipeline mongodb \
-  --input file:///path/to/NASA_access_log_Jul95 \
-  --batch-size 50000
+# --- MapReduce -----------------------------------------------------------
+./scripts/run.sh --pipeline mapreduce --input "$INPUT" --batch-size "$BATCH" --query q1
+./scripts/run.sh --pipeline mapreduce --input "$INPUT" --batch-size "$BATCH" --query q2
+./scripts/run.sh --pipeline mapreduce --input "$INPUT" --batch-size "$BATCH" --query q3
+./scripts/run.sh --pipeline mapreduce --input "$INPUT" --batch-size "$BATCH" --query all
 
-# Hive — runs HiveQL aggregations against a local HiveServer2
-./scripts/run.sh \
-  --pipeline hive \
-  --input file:///path/to/NASA_access_log_Jul95 \
-  --batch-size 50000 \
-  --hive-url jdbc:hive2://localhost:10000/default
+# --- Pig -----------------------------------------------------------------
+./scripts/run.sh --pipeline pig       --input "$INPUT" --batch-size "$BATCH" --query q1
+./scripts/run.sh --pipeline pig       --input "$INPUT" --batch-size "$BATCH" --query q2
+./scripts/run.sh --pipeline pig       --input "$INPUT" --batch-size "$BATCH" --query q3
+./scripts/run.sh --pipeline pig       --input "$INPUT" --batch-size "$BATCH" --query all
 
-# Run only Query 2 (Top Resources) through MapReduce
-./scripts/run.sh \
+# --- MongoDB (requires mongod on mongodb://localhost:27017) --------------
+./scripts/run.sh --pipeline mongodb   --input "$INPUT" --batch-size "$BATCH" --query q1
+./scripts/run.sh --pipeline mongodb   --input "$INPUT" --batch-size "$BATCH" --query q2
+./scripts/run.sh --pipeline mongodb   --input "$INPUT" --batch-size "$BATCH" --query q3
+./scripts/run.sh --pipeline mongodb   --input "$INPUT" --batch-size "$BATCH" --query all
+
+# --- Hive (requires HiveServer2 on jdbc:hive2://localhost:10000/default) -
+./scripts/run.sh --pipeline hive      --input "$INPUT" --batch-size "$BATCH" --query q1
+./scripts/run.sh --pipeline hive      --input "$INPUT" --batch-size "$BATCH" --query q2
+./scripts/run.sh --pipeline hive      --input "$INPUT" --batch-size "$BATCH" --query q3
+./scripts/run.sh --pipeline hive      --input "$INPUT" --batch-size "$BATCH" --query all
+```
+
+Or to script the whole 12-combination matrix as one block:
+
+```bash
+for PIPE in mapreduce pig mongodb hive; do
+  for Q in q1 q2 q3; do
+    ./scripts/run.sh --pipeline "$PIPE" --input "$INPUT" --batch-size "$BATCH" --query "$Q"
+  done
+done
+```
+
+### Pointing at both NASA log files at once
+
+Both `Jul95` and `Aug95` files in one directory → one run that scans them both:
+
+```bash
+./scripts/run.sh --pipeline mapreduce --input file://$PWD/nasa/logs --batch-size 100000 --query all
+```
+
+### Pointing at HDFS (cluster mode)
+
+```bash
+hdfs dfs -mkdir -p /nasa/logs
+hdfs dfs -put NASA_access_log_Jul95 /nasa/logs/
+hdfs dfs -put NASA_access_log_Aug95 /nasa/logs/
+
+./scripts/run.sh --pipeline mapreduce --input hdfs:///nasa/logs/ --batch-size 100000 --query all
+```
+
+### Without `scripts/run.sh`
+
+Use the raw `java -cp` form (the launcher just wraps this):
+
+```bash
+java -cp "target/etl-framework-1.0.jar:$(hadoop classpath)" com.etl.ETLRunner \
   --pipeline mapreduce \
   --input file:///path/to/NASA_access_log_Jul95 \
-  --query q2
+  --batch-size 50000 \
+  --query all \
+  --db-url  jdbc:mysql://localhost:3306/etldb \
+  --db-user etl \
+  --db-pass 'Etl@12345'
 ```
+
+### Launcher notes
+
+- The fat jar bundles `hive-jdbc`, whose META-INF entries cause `hadoop jar`'s unjar step to fail with `Mkdirs failed to create .../license`. The launcher uses `java -cp $(hadoop classpath)` instead, which sidesteps `hadoop jar` entirely while still resolving the local-mode `ClientProtocolProvider` from the system Hadoop install.
+- A small `META-INF/services/org.apache.hadoop.mapreduce.protocol.ClientProtocolProvider` file is shipped inside the jar so `LocalJobRunner` is discoverable even when `hadoop-client` is `<scope>provided</scope>`.
+- `hadoop` must be on `PATH` for the launcher to work.
 
 ---
 
 ## Queries
 
-All three queries are implemented identically across every pipeline. The same grouping keys, aggregation functions, and filter conditions are used in every execution backend.
+All three queries are implemented identically across every pipeline. With per-batch aggregation, the actual grouping is `(batch_id, <natural key>)` in every backend; the table below shows the **natural key** the query is conceptually grouped by.
 
-| Query | Group By | Output Columns |
-|---|---|---|
-| Daily Traffic Summary | `log_date`, `status_code` | `request_count`, `total_bytes` |
-| Top Requested Resources | `resource_path` | `request_count`, `total_bytes`, `distinct_host_count` — top 20 by request count |
-| Hourly Error Analysis | `log_date`, `log_hour` | `error_request_count`, `total_request_count`, `error_rate`, `distinct_error_hosts` — status codes 400–599 |
+| Query | Natural Group-By | Output Columns | Notes |
+|---|---|---|---|
+| Q1 Daily Traffic Summary | `log_date`, `status_code` | `request_count`, `total_bytes` | Plain SUM/COUNT per (date, status). |
+| Q2 Top Requested Resources | `resource_path` | `request_count`, `total_bytes`, `distinct_host_count` | Top 20 *per batch* by `request_count`. |
+| Q3 Hourly Error Analysis | `log_date`, `log_hour` | `error_request_count`, `total_request_count`, `error_rate`, `distinct_error_hosts` | Error = HTTP status in `[400, 599]`. |
+
+### How each backend expresses Q1 (daily_traffic)
+
+| Backend | Form |
+|---|---|
+| MapReduce | `LogMapper` emits `(batch_id\|log_date\|status_code, bytes)`; `QueryReducer` sums per key. |
+| Pig | `pig/daily_traffic.pig`: `GROUP cleaned BY (log_date, status_code); FOREACH ... COUNT, SUM`. Run once per batch file. |
+| MongoDB | `db.coll.aggregate([{$group:{_id:{batch_id,log_date,status_code}, request_count:{$sum:1}, total_bytes:{$sum:'$bytes'}}}, {$sort:{...}}])` |
+| Hive | `SELECT batch_id, log_date, status_code, COUNT(*), SUM(bytes) FROM <table> GROUP BY batch_id, log_date, status_code` |
+
+### How each backend expresses Q2 (top_resources, top 20 per batch)
+
+| Backend | Form |
+|---|---|
+| MapReduce | `LogMapper` emits `(batch_id\|resource_path, host\|bytes)`; reducer counts; `postProcessTopResources()` sorts and takes top 20 per `batch_id` in Java. |
+| Pig | `pig/top_resources.pig`: `GROUP cleaned BY resource_path; FOREACH ... COUNT, SUM, COUNT(DISTINCT hosts)`. Run once per batch file; top-20 selection in Java. |
+| MongoDB | Aggregation: `$group` → `$project distinct_hosts:$size` → `$sort` → `$group _id:batch_id, top:$push` → `$project top:$slice 20`. |
+| Hive | `SELECT ... FROM (SELECT ..., ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY COUNT(*) DESC) AS rn FROM <table> GROUP BY batch_id, resource_path) WHERE rn <= 20` |
+
+### How each backend expresses Q3 (hourly_errors)
+
+| Backend | Form |
+|---|---|
+| MapReduce | `LogMapper` emits `(batch_id\|log_date\|log_hour, status_code\|host)`; reducer counts errors / totals / distinct error hosts, computes `error_rate`. |
+| Pig | `pig/hourly_errors.pig`: `GROUP BY (log_date, log_hour); FILTER errors BY status_code >= 400 AND <= 599`. Per batch file. |
+| MongoDB | `$group` with `$sum: $cond[status BETWEEN 400 AND 599]`, `$addToSet` of host gated on the same condition, `$divide` for `error_rate`. |
+| Hive | `SUM(CASE WHEN status_code BETWEEN 400 AND 599 THEN 1 ELSE 0 END)` + `COUNT(DISTINCT CASE WHEN ... THEN host END)`. |
 
 ---
 
@@ -484,11 +757,12 @@ Stores results of all queries across all pipelines.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INT PK | Auto-increment row identifier |
+| `id` | BIGINT PK | Auto-increment row identifier |
 | `run_id` | VARCHAR(36) FK | Links to `etl_runs` |
-| `pipeline` | VARCHAR(20) | Redundant for faster filtering |
-| `batch_id` | INT | Always `1` for global aggregation (legacy support for batching) |
-| `query_name` | VARCHAR(30) | Query identifier (`daily_traffic`, `top_resources`, `hourly_errors`) |
+| `pipeline` | VARCHAR(20) | Backend label — duplicated here for faster filtering |
+| `batch_id` | INT | Which batch (1..N) this aggregate came from |
+| `executed_at` | TIMESTAMP | Stamped at write time |
+| `query_name` | VARCHAR(30) | `daily_traffic` / `top_resources` / `hourly_errors` |
 
 #### Query-specific columns (sparse schema)
 
@@ -512,24 +786,16 @@ Stores results of all queries across all pipelines.
 
 ### Design Rationale
 
-- **Separation of concerns**  
-  `etl_runs` stores execution metadata, while `etl_results` stores analytical outputs.
-
-- **Unified results table**  
-  A single table is used for all queries using `query_name` as a discriminator, avoiding schema duplication.
-
-- **Global aggregation compatibility**  
-  Since pipelines now produce **global aggregates**, each query result appears once per key (`batch_id = 1`).
-
-- **Extensibility**  
-  New queries or pipelines can be added without changing schema—only new rows are inserted.
-
-- **Query simplicity**  
-  Results can be easily filtered using:
+- **Separation of concerns** — `etl_runs` holds *execution* metadata, `etl_batches` holds per-batch *batching* metadata, and `etl_results` holds *analytical* outputs. Each table answers exactly one question.
+- **Unified results table** — A single `etl_results` table is used for all three queries with `query_name` as a discriminator. Columns irrelevant to a given query are `NULL` (sparse schema). New queries can be added without schema changes.
+- **Real `batch_id`** — Every result row carries the `batch_id` of the batch it was computed from. Together with the `etl_batches` table this makes batching auditable: `SUM(records_in_batch) = total_records`, `COUNT(DISTINCT batch_id) = total_batches`.
+- **Cheap rollups in SQL** — The reporter computes the global view by running `SUM(...) GROUP BY <group-key>` over `etl_results` filtered by `(run_id, query_name)` — no extra pipeline plumbing needed.
+- **Query simplicity** — Most reporting queries fit the same template:
   ```sql
-  WHERE run_id = ? AND query_name = ?
+  SELECT * FROM etl_results WHERE run_id = ? AND query_name = ? ORDER BY batch_id, ...
+  ```
 
-See sql/schema.sql for full DDL and sql/sample_queries.sql for reporting queries.
+See [`sql/schema.sql`](sql/schema.sql) for the full DDL and [`sql/sample_queries.sql`](sql/sample_queries.sql) for reporting queries.
 
 ## Project Structure
 
@@ -537,38 +803,48 @@ See sql/schema.sql for full DDL and sql/sample_queries.sql for reporting queries
 etl-framework/
 ├── config/
 │   └── db.properties.example
-├── pig/
+├── pig/                                # Pig Latin scripts (one per query)
 │   ├── daily_traffic.pig
 │   ├── top_resources.pig
 │   └── hourly_errors.pig
 ├── sql/
-│   ├── schema.sql
-│   └── sample_queries.sql
+│   ├── schema.sql                      # etl_runs / etl_batches / etl_results DDL
+│   └── sample_queries.sql              # reporting queries
 ├── scripts/
-│   ├── run.sh
-│   └── setup_hdfs.sh
-└── src/main/java/com/etl/
-    ├── ETLRunner.java
-    ├── PipelineFactory.java
-    ├── core/
-    │   ├── ETLConfig.java
-    │   ├── LogParser.java
-    │   ├── LogRecord.java
-    │   ├── Pipeline.java
-    │   ├── PipelineResult.java
-    │   └── ResultRow.java
-    ├── db/ResultLoader.java
-    ├── pipeline/
-    │   ├── mapreduce/
-    │   │   ├── MapReducePipeline.java
-    │   │   ├── LogMapper.java
-    │   │   └── QueryReducer.java
-    │   ├── pig/
-    │   │   ├── PigPipeline.java
-    │   │   └── LogParserUDF.java
-    │   ├── mongodb/MongoDBPipeline.java
-    │   └── hive/HivePipeline.java
-    └── report/Reporter.java
+│   ├── run.sh                          # launcher (java -cp + hadoop classpath)
+│   └── setup_hdfs.sh                   # optional HDFS upload helper
+├── pom.xml
+└── src/main/
+    ├── java/com/etl/
+    │   ├── ETLRunner.java              # CLI parser + lifecycle
+    │   ├── PipelineFactory.java        # name → Pipeline implementation
+    │   ├── core/
+    │   │   ├── BatchSplitter.java      # raw NCSA → batch-NNNNN.log files
+    │   │   ├── ETLConfig.java          # immutable run config
+    │   │   ├── LogParser.java          # NCSA Combined Log regex parser
+    │   │   ├── LogRecord.java          # parsed record DTO
+    │   │   ├── Pipeline.java           # backend interface
+    │   │   ├── PipelineResult.java     # rows + per-batch metadata
+    │   │   └── ResultRow.java          # one (run × query × batch × key) row
+    │   ├── db/
+    │   │   └── ResultLoader.java       # writes etl_runs / etl_batches / etl_results
+    │   ├── pipeline/
+    │   │   ├── mapreduce/
+    │   │   │   ├── MapReducePipeline.java
+    │   │   │   ├── LogMapper.java      # batch_id from FileSplit filename
+    │   │   │   └── QueryReducer.java
+    │   │   ├── pig/
+    │   │   │   ├── PigPipeline.java    # per-batch script invocations
+    │   │   │   └── LogParserUDF.java   # bridges Pig → LogParser
+    │   │   ├── mongodb/
+    │   │   │   └── MongoDBPipeline.java
+    │   │   └── hive/
+    │   │       └── HivePipeline.java
+    │   └── report/
+    │       └── Reporter.java           # Run + Batch + Per-Batch + Rollup
+    └── resources/
+        └── META-INF/services/
+            └── org.apache.hadoop.mapreduce.protocol.ClientProtocolProvider
 ```
 
 ---
@@ -597,6 +873,75 @@ The CLI, `LogParser`, `ResultRow` schema, `ResultLoader`, and `Reporter` are reu
 - For Hive, the splitter writes `batch-NNNNN.tsv` files where `batch_id` is the first column; the external table has a typed `batch_id INT` column.
 - For MongoDB, each parsed record is tagged with `batch_id` in-memory before `insertMany`, and every aggregation `$group`s on `batch_id` first.
 - `total_batches` and `avg_batch_size = total_records / total_batches` are persisted to `etl_runs`; per-batch `(records_in_batch, malformed_in_batch)` are persisted to `etl_batches`.
+
+## Sample Output
+
+What the reporter prints for a small `mapreduce / q1 / batch_size=1500` run over the first 5000 lines of `NASA_access_log_Jul95`:
+
+```
+=================================================
+ETL Run Report
+=================================================
+Pipeline           : mapreduce
+Query              : daily_traffic
+Run ID             : 773607c0-f7a9-4c01-84ec-fa233501fe07
+Executed At        : 2026-05-13 20:52:55 IST
+Runtime            : 2457 ms (2.46 s)
+Batch Size         : 1500
+Total Records      : 5000
+Malformed Records  : 0
+Total Batches      : 4
+Average Batch Size : 1250.00
+=================================================
+
+Batch Summary
+-------------------------------------------------
+BatchId  Records  Malformed
+1        1500     0
+2        1500     0
+3        1500     0
+4        500      0
+
+Per-Batch Results: daily_traffic
+-------------------------------------------------
+BatchId  LogDate     StatusCode  RequestCount  TotalBytes
+1        1995-07-01  200         1327          30449608
+1        1995-07-01  302         68            5100
+1        1995-07-01  304         95            0
+1        1995-07-01  404         10            0
+2        1995-07-01  200         1338          34116835
+...
+
+Global Rollup: daily_traffic
+-------------------------------------------------
+LogDate     StatusCode  RequestCount  TotalBytes
+1995-07-01  200         4470          116989718
+1995-07-01  302         240           20403
+1995-07-01  304         263           0
+1995-07-01  404         27            0
+```
+
+And in MySQL:
+
+```sql
+SELECT pipeline, query_name, total_records, total_batches, avg_batch_size, runtime_ms
+FROM etl_runs ORDER BY executed_at DESC LIMIT 1;
++-----------+---------------+---------------+---------------+----------------+------------+
+| pipeline  | query_name    | total_records | total_batches | avg_batch_size | runtime_ms |
++-----------+---------------+---------------+---------------+----------------+------------+
+| mapreduce | daily_traffic |          5000 |             4 |        1250.00 |       2457 |
++-----------+---------------+---------------+---------------+----------------+------------+
+
+SELECT * FROM etl_batches WHERE run_id = '773607c0-...';
++--------+------------------+--------------------+
+| batch_id | records_in_batch | malformed_in_batch |
++--------+------------------+--------------------+
+|      1 |             1500 |                  0 |
+|      2 |             1500 |                  0 |
+|      3 |             1500 |                  0 |
+|      4 |              500 |                  0 |
++--------+------------------+--------------------+
+```
 
 ## Known Limitations
 
