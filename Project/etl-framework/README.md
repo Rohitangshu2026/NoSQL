@@ -4,6 +4,8 @@ A multi-pipeline ETL and reporting framework for NASA HTTP web server log analyt
 
 The user picks the execution backend, the query (`q1`, `q2`, `q3`, or `all`), and the batch size at the CLI. The ETL logic, parsing rules, batching logic, and reporting layer are identical across all four pipelines so the comparison is fair.
 
+**Batching model.** Every pipeline produces *per-batch* aggregates: the raw input is split into batches of `batchSize` log lines, each batch is aggregated independently in the backend's own engine, and one result row is emitted per `(batch_id, group-by key)`. The reporter then computes a rolled-up global view in SQL on top of the per-batch rows.
+
 ---
 
 ## Architecture
@@ -452,12 +454,25 @@ Stores metadata about each ETL run.
 |---|---|---|
 | `run_id` | VARCHAR(36) PK | UUID generated at startup |
 | `pipeline` | VARCHAR(20) | Execution backend (mapreduce / pig / mongodb / hive) |
+| `query_name` | VARCHAR(30) | Selected query: `daily_traffic` / `top_resources` / `hourly_errors` / `all` |
 | `batch_size` | INT | Configured records per batch |
-| `total_records` | INT | Total records processed |
-| `total_batches` | INT | Number of batches processed (input splits / logical batches) |
-| `malformed_count` | INT | Records that failed parsing |
+| `total_records` | BIGINT | Total records processed |
+| `total_batches` | INT | Number of non-empty batches |
+| `avg_batch_size` | DECIMAL(15,2) | `total_records / total_batches` |
+| `malformed_count` | BIGINT | Records that failed parsing |
 | `runtime_ms` | BIGINT | End-to-end runtime (read → compute → DB write) |
 | `executed_at` | TIMESTAMP | Auto-generated timestamp of execution |
+
+### **`etl_batches`** — one row per batch processed in a run
+
+Captures per-batch metadata so the batching decisions are auditable.
+
+| Column | Type | Description |
+|---|---|---|
+| `run_id` | VARCHAR(36) | FK to `etl_runs` |
+| `batch_id` | INT | 1..N sequential batch identifier |
+| `records_in_batch` | INT | Lines (records) belonging to this batch |
+| `malformed_in_batch` | INT | Of those, lines that failed parsing |
 
 ---
 
@@ -465,7 +480,7 @@ Stores metadata about each ETL run.
 
 Stores results of all queries across all pipelines.
 
-> One row represents a **(run × query × group-by key)**.
+> One row represents a **(run × query × batch × group-by key)**. With per-batch aggregation, the same `log_date` / `resource_path` / `(log_date, log_hour)` can appear once per batch that contained it.
 
 | Column | Type | Description |
 |---|---|---|
@@ -560,22 +575,32 @@ etl-framework/
 
 ## Pipeline Equivalence
 
-All four pipelines implement the same logical ETL steps and produce the same result schema:
+All four pipelines implement the same logical ETL steps, do **per-batch** aggregation, and produce the same result schema:
 
 | Stage | MapReduce | Pig | MongoDB | Hive |
 |---|---|---|---|---|
 | Raw input | NCSA log lines (local FS / HDFS) | NCSA log lines | NCSA log lines | NCSA log lines |
-| Parsing | `LogMapper` calls `LogParser` | `LogParserUDF` calls `LogParser` | Java `LogParser` before `insertMany` | Java `LogParser` while writing TSV batch files |
-| Batching | Hadoop input splits | TSV batch files of `batchSize` lines | `insertMany` chunks of `batchSize` documents | TSV batch files of `batchSize` lines |
-| Aggregation | MR jobs (`LogMapper` + `QueryReducer`) | Pig Latin scripts under `pig/*.pig` | MongoDB aggregation framework (`$group`, `$sort`, `$limit`) | HiveQL `GROUP BY` queries through HiveServer2 JDBC |
+| Batch splitter | `BatchSplitter` writes raw `batch-NNNNN.log` files | `BatchSplitter` writes raw `batch-NNNNN.log` files | In-memory `insertMany` chunks of `batchSize` docs, tagged with `batch_id` | Java `prepareBatches` writes parsed TSV with `batch_id` as col 1 |
+| Parsing | `LogMapper` (inside MR) calls `LogParser`; `batch_id` recovered from `FileSplit` filename | Per-batch invocations of `pig/*.pig`; `LogParserUDF` parses inside Pig | Java `LogParser` before insert | Java `LogParser` while writing TSV |
+| Aggregation grain | `GROUP BY batch_id, …` via prefixed reducer key | One Pig run per batch → per-batch results stamped in Java | `$group _id: {batch_id, …}` | `GROUP BY batch_id, …` in HiveQL |
+| Top-20 limit | Top 20 per batch in Java | Top 20 per batch in Java | `$sort` + `$group $push` + `$slice 20` | `ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY count DESC)` |
 | Result load | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL |
-| Reporting | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL | Shared `Reporter` reads from MySQL |
+| Reporting | Shared `Reporter`: per-batch + SQL global rollup | same | same | same |
 
 The CLI, `LogParser`, `ResultRow` schema, `ResultLoader`, and `Reporter` are reused unchanged across every pipeline.
 
-## Known Limitations (Local Mode)
+## Batching Strategy
 
-- **`batch_id` is always 1** in result rows because every pipeline produces a single set of *global* aggregates per query. The number of ingestion batches is stored in `etl_runs.total_batches`, and the average batch size in the reporting output.
-- **Pig `malformed_count` is exact** — it is now computed in Java during batch preparation (`prepareBatches`) before Pig runs, since Pig does not expose a counter equivalent.
+- The raw NASA log is **split into batches of exactly `--batch-size` input lines**. Both successfully-parsed and malformed lines count toward a batch's size, so the batch boundaries are deterministic and reproducible.
+- Each batch gets a sequential `batch_id` starting at 1. The final batch may contain fewer than `batch-size` records — it is still counted as one valid batch.
+- For MR and Pig, the splitter writes `batch-NNNNN.log` files under `/tmp/etl_{mr,pig}_batches/<runId>/`. Each pipeline recovers `batch_id` from the filename so the aggregation engine itself sees the batch tag.
+- For Hive, the splitter writes `batch-NNNNN.tsv` files where `batch_id` is the first column; the external table has a typed `batch_id INT` column.
+- For MongoDB, each parsed record is tagged with `batch_id` in-memory before `insertMany`, and every aggregation `$group`s on `batch_id` first.
+- `total_batches` and `avg_batch_size = total_records / total_batches` are persisted to `etl_runs`; per-batch `(records_in_batch, malformed_in_batch)` are persisted to `etl_batches`.
+
+## Known Limitations
+
+- **Top-20 global rollup is approximate** — only per-batch top-20s are SUM-ed across batches. A resource that ranks 21st in every batch would be missed. The reporter prints this caveat next to the Q2 rollup table.
 - **Hive pipeline** requires HiveServer2 to be running. The fat-jar bundles `hive-jdbc:3.1.3` so no client-side install of Hive is needed beyond the running server.
 - **MongoDB pipeline** uses one temporary collection per run (`etl_logs_<runId-hex>` inside the `etl_logs` database) and drops it on completion.
+- **Launcher uses `java -cp $(hadoop classpath)`, not `hadoop jar`.** The fat jar bundles `hive-jdbc`, whose META-INF entries make `hadoop jar`'s unjar step fail. `scripts/run.sh` builds the right classpath automatically — just make sure `hadoop` is on `PATH`.
