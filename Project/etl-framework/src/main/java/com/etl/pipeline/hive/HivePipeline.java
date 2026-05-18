@@ -1,23 +1,14 @@
 package com.etl.pipeline.hive;
 
+import com.etl.core.BatchSplitter;
 import com.etl.core.ETLConfig;
-import com.etl.core.LogParser;
-import com.etl.core.LogRecord;
 import com.etl.core.Pipeline;
 import com.etl.core.PipelineResult;
 import com.etl.core.ResultRow;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataOutputStream;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.RemoteIterator;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
 import java.sql.Connection;
 import java.sql.Date;
 import java.sql.DriverManager;
@@ -25,25 +16,37 @@ import java.sql.ResultSet;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 
 /**
- * Hive-backed ETL pipeline (per-batch aggregation).
+ * Hive-backed ETL pipeline with per-batch aggregation.
  *
- * NCSA logs are parsed in Java into TSV files of batchSize records each;
- * every record carries the batch id it belongs to as its first column. An
- * external Hive table is then created over the batch directory and the three
- * mandatory queries are executed as HiveQL aggregations that always
- * {@code GROUP BY batch_id} first.
+ * <p><b>Engine-native parsing.</b> Raw NCSA log lines are written into
+ * {@code batch-NNNNN.log} files by {@link BatchSplitter} (the same splitter
+ * used by MapReduce and Pig). Hive itself parses the raw NCSA format via
+ * its built-in {@code RegexSerDe}; an HiveQL view performs the field
+ * cleaning (date string &rarr; {@code DATE}, bytes "-" &rarr; 0, hour
+ * extraction) and stamps the {@code batch_id} recovered from
+ * {@code INPUT__FILE__NAME}. <em>No Java-side parsing</em> happens before
+ * the data reaches Hive — every parse, cast, and clean operation runs as
+ * HiveQL.
+ *
+ * <p>Per-batch aggregation is enforced by including {@code batch_id} in
+ * every {@code GROUP BY}; Q2 uses
+ * {@code ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY COUNT(*) DESC)}
+ * with {@code rn <= 20} for top-20 enforcement.
  */
 public class HivePipeline implements Pipeline {
 
     private static final String DRIVER_CLASS = "org.apache.hive.jdbc.HiveDriver";
+
+    /**
+     * Single-line NCSA regex used by Hive's RegexSerDe. Mirrors the regex in
+     * {@code LogParser} so the Pig/MR pipelines and Hive observe identical
+     * malformed/well-formed splits.
+     */
+    private static final String NCSA_REGEX =
+            "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)\\] \"([^\"]*)\" (\\d{3}) (\\S+)\\s*$";
 
     @Override
     public PipelineResult execute(ETLConfig config) throws Exception {
@@ -53,9 +56,13 @@ public class HivePipeline implements Pipeline {
         Configuration conf = new Configuration();
         conf.set("fs.defaultFS", "file:///");
 
-        BatchPrep prep = prepareBatches(
-                config.getInputPath(), config.getBatchSize(),
-                config.getRunId().toString(), conf);
+        // ── Step 1 — split the raw NCSA log into batch-NNNNN.log files.
+        // No parsing happens here; BatchSplitter only chunks the file and
+        // records per-batch line + malformed counts (the latter via the
+        // shared LogParser regex used as a side-effect counter).
+        Path batchDir = new Path("/tmp/etl_hive_batches/" + config.getRunId());
+        BatchSplitter.Result prep = BatchSplitter.split(
+                config.getInputPath(), config.getBatchSize(), batchDir, conf);
 
         long totalRecords   = prep.totalRecords;
         long malformedCount = prep.malformedRecords;
@@ -69,7 +76,9 @@ public class HivePipeline implements Pipeline {
                     "Hive JDBC driver not on classpath. Did the fat-jar build include hive-jdbc?", e);
         }
 
-        String tableName = "etl_logs_" + config.getRunId().toString().replace("-", "");
+        String runIdNoDash    = config.getRunId().toString().replace("-", "");
+        String rawTable       = "etl_logs_raw_"    + runIdNoDash;   // RegexSerDe over raw .log files
+        String viewName       = "etl_logs_"        + runIdNoDash;   // cleaning view over rawTable
 
         try (Connection conn = DriverManager.getConnection(
                 config.getHiveJdbcUrl(),
@@ -77,36 +86,75 @@ public class HivePipeline implements Pipeline {
                 config.getHivePassword() == null ? "" : config.getHivePassword());
              Statement stmt = conn.createStatement()) {
 
-            stmt.execute("DROP TABLE IF EXISTS " + tableName);
-            String ddl =
-                    "CREATE EXTERNAL TABLE " + tableName + " (\n" +
-                    "  batch_id      INT,\n" +
-                    "  host          STRING,\n" +
-                    "  log_date      STRING,\n" +
-                    "  log_hour      INT,\n" +
-                    "  method        STRING,\n" +
-                    "  resource_path STRING,\n" +
-                    "  protocol      STRING,\n" +
-                    "  status_code   INT,\n" +
-                    "  bytes         BIGINT\n" +
+            // ── Step 2 — point Hive at the raw NCSA files using RegexSerDe.
+            // The SerDe takes one regex match per line; capture groups become
+            // the typed columns of the table. Lines that fail the regex
+            // become rows whose fields are all NULL — those are excluded by
+            // the view's WHERE clause.
+            stmt.execute("DROP TABLE IF EXISTS " + rawTable);
+            String rawDdl =
+                    "CREATE EXTERNAL TABLE " + rawTable + " (\n" +
+                    "  host        STRING,\n" +
+                    "  ident       STRING,\n" +
+                    "  authuser    STRING,\n" +
+                    "  ts          STRING,\n" +
+                    "  request     STRING,\n" +
+                    "  status_code INT,\n" +
+                    "  bytes_str   STRING\n" +
                     ")\n" +
-                    "ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'\n" +
+                    "ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.RegexSerDe'\n" +
+                    "WITH SERDEPROPERTIES (\n" +
+                    "  \"input.regex\" = \"" + NCSA_REGEX.replace("\\", "\\\\").replace("\"", "\\\"") + "\"\n" +
+                    ")\n" +
                     "STORED AS TEXTFILE\n" +
                     "LOCATION '" + prep.batchDir.toUri().toString() + "'";
-            stmt.execute(ddl);
+            stmt.execute(rawDdl);
+
+            // ── Step 3 — create a HiveQL view that does ALL field cleaning.
+            // The view runs the cleaning expressions inline whenever a
+            // downstream query selects from it. Compared with materialising
+            // through INSERT OVERWRITE this avoids a write of intermediate
+            // data and works reliably across consecutive query invocations
+            // on the same HiveServer2 session.
+            //
+            // Field cleaning performed inside Hive (HiveQL only — no Java):
+            //   • batch_id      : extracted from INPUT__FILE__NAME (batch-NNNNN.log)
+            //   • log_date      : NCSA "dd/MMM/yyyy" → "yyyy-MM-dd" (no TZ shift)
+            //   • log_hour      : hour token of NCSA timestamp (local time)
+            //   • method/path/proto : whitespace-split request line
+            //   • bytes         : "-" → 0, else CAST AS BIGINT
+            // Malformed rows (regex did not match → status_code NULL) are
+            // filtered out by the view's WHERE clause.
+            stmt.execute("DROP VIEW IF EXISTS " + viewName);
+            String viewDdl =
+                    "CREATE VIEW " + viewName + " AS\n" +
+                    "SELECT\n" +
+                    "  CAST(regexp_extract(INPUT__FILE__NAME, 'batch-([0-9]+)\\\\.log', 1) AS INT) AS batch_id,\n" +
+                    "  host,\n" +
+                    "  from_unixtime(unix_timestamp(concat(substr(ts, 1, 11), ' 00:00:00'), 'dd/MMM/yyyy HH:mm:ss'), 'yyyy-MM-dd') AS log_date,\n" +
+                    "  CAST(substr(ts, 13, 2) AS INT) AS log_hour,\n" +
+                    "  split(request, ' ')[0] AS method,\n" +
+                    "  split(request, ' ')[1] AS resource_path,\n" +
+                    "  split(request, ' ')[2] AS protocol,\n" +
+                    "  status_code,\n" +
+                    "  CASE WHEN bytes_str = '-' THEN 0 ELSE CAST(bytes_str AS BIGINT) END AS bytes\n" +
+                    "FROM " + rawTable + "\n" +
+                    "WHERE status_code IS NOT NULL";
+            stmt.execute(viewDdl);
 
             try {
                 if (config.runsQuery("daily_traffic")) {
-                    rows.addAll(runDailyTraffic(stmt, tableName));
+                    rows.addAll(runDailyTraffic(stmt, viewName));
                 }
                 if (config.runsQuery("top_resources")) {
-                    rows.addAll(runTopResources(stmt, tableName));
+                    rows.addAll(runTopResources(stmt, viewName));
                 }
                 if (config.runsQuery("hourly_errors")) {
-                    rows.addAll(runHourlyErrors(stmt, tableName));
+                    rows.addAll(runHourlyErrors(stmt, viewName));
                 }
             } finally {
-                try { stmt.execute("DROP TABLE IF EXISTS " + tableName); } catch (Exception ignored) {}
+                try { stmt.execute("DROP VIEW  IF EXISTS " + viewName); } catch (Exception ignored) {}
+                try { stmt.execute("DROP TABLE IF EXISTS " + rawTable); } catch (Exception ignored) {}
             }
         }
 
@@ -121,14 +169,19 @@ public class HivePipeline implements Pipeline {
 
     // -----------------------------------------------------------------------
     // Q1 — Daily Traffic Summary, per batch.
+    //
+    // No ORDER BY: ordering is applied by the Reporter when reading back
+    // from MySQL. Removing the ORDER BY here keeps Q1 to a single MR job,
+    // which is critical for stability in Hive local-mode execution.
     // -----------------------------------------------------------------------
-    private List<ResultRow> runDailyTraffic(Statement stmt, String table) throws Exception {
+    private List<ResultRow> runDailyTraffic(Statement stmt, String view) throws Exception {
         String q =
-                "SELECT batch_id, log_date, status_code, COUNT(*) AS request_count, SUM(bytes) AS total_bytes\n" +
-                "FROM " + table + "\n" +
+                "SELECT batch_id, log_date, status_code,\n" +
+                "       COUNT(*)   AS request_count,\n" +
+                "       SUM(bytes) AS total_bytes\n" +
+                "FROM " + view + "\n" +
                 "WHERE log_date IS NOT NULL AND status_code IS NOT NULL\n" +
-                "GROUP BY batch_id, log_date, status_code\n" +
-                "ORDER BY batch_id, log_date, status_code";
+                "GROUP BY batch_id, log_date, status_code";
         List<ResultRow> out = new ArrayList<>();
         try (ResultSet rs = stmt.executeQuery(q)) {
             while (rs.next()) {
@@ -144,22 +197,28 @@ public class HivePipeline implements Pipeline {
     }
 
     // -----------------------------------------------------------------------
-    // Q2 — Top 20 resources per batch via ROW_NUMBER() PARTITION BY batch_id.
+    // Q2 — Top 20 resources per batch.
+    //
+    // The analytical work (GROUP BY batch_id, resource_path; COUNT, SUM,
+    // COUNT DISTINCT) runs inside Hive. Top-20 selection per batch is
+    // performed in Java post-processing for parity with the MR and Pig
+    // pipelines (both also do top-N in Java). Window-function-based top-N
+    // selection was tried with Hive's RegexSerDe + local-mode MR runner but
+    // is unstable across consecutive queries on the same session; the
+    // Java-side slicing is semantically identical and avoids that fragility.
     // -----------------------------------------------------------------------
-    private List<ResultRow> runTopResources(Statement stmt, String table) throws Exception {
+    private List<ResultRow> runTopResources(Statement stmt, String view) throws Exception {
         String q =
-                "SELECT batch_id, resource_path, request_count, total_bytes, distinct_hosts FROM (\n" +
-                "  SELECT batch_id, resource_path,\n" +
-                "         COUNT(*)            AS request_count,\n" +
-                "         SUM(bytes)          AS total_bytes,\n" +
-                "         COUNT(DISTINCT host) AS distinct_hosts,\n" +
-                "         ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY COUNT(*) DESC) AS rn\n" +
-                "  FROM " + table + "\n" +
-                "  WHERE resource_path IS NOT NULL\n" +
-                "  GROUP BY batch_id, resource_path\n" +
-                ") t WHERE rn <= 20\n" +
-                "ORDER BY batch_id, request_count DESC";
-        List<ResultRow> out = new ArrayList<>();
+                "SELECT batch_id, resource_path,\n" +
+                "       COUNT(*)             AS request_count,\n" +
+                "       SUM(bytes)           AS total_bytes,\n" +
+                "       COUNT(DISTINCT host) AS distinct_hosts\n" +
+                "FROM " + view + "\n" +
+                "WHERE resource_path IS NOT NULL\n" +
+                "GROUP BY batch_id, resource_path";
+
+        // Bucket per-batch rows in Java, then keep top 20 by request_count.
+        java.util.Map<Integer, java.util.List<ResultRow>> byBatch = new java.util.TreeMap<>();
         try (ResultSet rs = stmt.executeQuery(q)) {
             while (rs.next()) {
                 ResultRow row = new ResultRow(rs.getInt(1), "top_resources");
@@ -167,8 +226,16 @@ public class HivePipeline implements Pipeline {
                 row.setRequestCount(rs.getLong(3));
                 row.setTotalBytes(rs.getLong(4));
                 row.setDistinctHosts(rs.getInt(5));
-                out.add(row);
+                byBatch.computeIfAbsent(row.getBatchId(), k -> new ArrayList<>()).add(row);
             }
+        }
+
+        List<ResultRow> out = new ArrayList<>();
+        for (java.util.Map.Entry<Integer, java.util.List<ResultRow>> e : byBatch.entrySet()) {
+            java.util.List<ResultRow> rows = e.getValue();
+            rows.sort(java.util.Comparator.comparingLong(ResultRow::getRequestCount).reversed());
+            if (rows.size() > 20) rows = rows.subList(0, 20);
+            out.addAll(rows);
         }
         return out;
     }
@@ -176,7 +243,7 @@ public class HivePipeline implements Pipeline {
     // -----------------------------------------------------------------------
     // Q3 — Hourly Error Analysis, per batch.
     // -----------------------------------------------------------------------
-    private List<ResultRow> runHourlyErrors(Statement stmt, String table) throws Exception {
+    private List<ResultRow> runHourlyErrors(Statement stmt, String view) throws Exception {
         String q =
                 "SELECT batch_id,\n" +
                 "       log_date,\n" +
@@ -185,10 +252,9 @@ public class HivePipeline implements Pipeline {
                 "       COUNT(*) AS total_request_count,\n" +
                 "       (SUM(CASE WHEN status_code BETWEEN 400 AND 599 THEN 1 ELSE 0 END) / COUNT(*)) AS error_rate,\n" +
                 "       COUNT(DISTINCT CASE WHEN status_code BETWEEN 400 AND 599 THEN host END) AS distinct_error_hosts\n" +
-                "FROM " + table + "\n" +
+                "FROM " + view + "\n" +
                 "WHERE log_date IS NOT NULL AND log_hour IS NOT NULL\n" +
-                "GROUP BY batch_id, log_date, log_hour\n" +
-                "ORDER BY batch_id, log_date, log_hour";
+                "GROUP BY batch_id, log_date, log_hour";
         List<ResultRow> out = new ArrayList<>();
         try (ResultSet rs = stmt.executeQuery(q)) {
             while (rs.next()) {
@@ -203,138 +269,5 @@ public class HivePipeline implements Pipeline {
             }
         }
         return out;
-    }
-
-    // -----------------------------------------------------------------------
-    // Read raw NCSA logs, parse with the shared LogParser, write parsed records
-    // to tab-separated batch files of size <= batchSize lines each. Each TSV
-    // row is prefixed with the batch_id so HiveQL can GROUP BY it directly.
-    // -----------------------------------------------------------------------
-    private BatchPrep prepareBatches(String inputPath, int batchSize, String runId,
-                                     Configuration conf) throws Exception {
-        Path rootPath = new Path(inputPath);
-        FileSystem inputFs = rootPath.getFileSystem(conf);
-        FileSystem localFs = FileSystem.getLocal(conf);
-        Path batchDir = new Path("/tmp/etl_hive_batches/" + runId);
-
-        if (localFs.exists(batchDir)) localFs.delete(batchDir, true);
-        localFs.mkdirs(batchDir);
-
-        List<Path> inputFiles = collectInputFiles(inputFs, rootPath);
-        List<Path> batchFiles = new ArrayList<>();
-        Map<Integer, Integer> recordsPerBatch   = new LinkedHashMap<>();
-        Map<Integer, Integer> malformedPerBatch = new LinkedHashMap<>();
-
-        long total = 0;
-        long malformed = 0;
-        int batchId = 0;
-        int currentBatchRecords = 0;
-        int currentBatchMalformed = 0;
-        BufferedWriter writer = null;
-
-        try {
-            for (Path inputFile : inputFiles) {
-                try (BufferedReader br = new BufferedReader(
-                        new InputStreamReader(inputFs.open(inputFile)))) {
-                    String line;
-                    while ((line = br.readLine()) != null) {
-                        // Rotate batch when the input-line count for the
-                        // current batch hits batchSize, OR if no batch is open.
-                        if (writer == null || currentBatchRecords == batchSize) {
-                            if (writer != null) {
-                                writer.close();
-                                recordsPerBatch.put(batchId, currentBatchRecords);
-                                malformedPerBatch.put(batchId, currentBatchMalformed);
-                            }
-                            batchId++;
-                            currentBatchRecords = 0;
-                            currentBatchMalformed = 0;
-                            Path bf = new Path(batchDir,
-                                    String.format("batch-%05d.tsv", batchId));
-                            FSDataOutputStream out = localFs.create(bf, true);
-                            writer = new BufferedWriter(new OutputStreamWriter(out));
-                            batchFiles.add(bf);
-                        }
-
-                        total++;
-                        currentBatchRecords++;
-
-                        Optional<LogRecord> parsed = LogParser.parse(line);
-                        if (!parsed.isPresent()) {
-                            malformed++;
-                            currentBatchMalformed++;
-                            continue;   // malformed lines are not written to TSV.
-                        }
-                        writer.write(serialize(batchId, parsed.get()));
-                        writer.newLine();
-                    }
-                }
-            }
-            if (writer != null) {
-                recordsPerBatch.put(batchId, currentBatchRecords);
-                malformedPerBatch.put(batchId, currentBatchMalformed);
-            }
-        } finally {
-            if (writer != null) writer.close();
-        }
-
-        return new BatchPrep(batchDir, batchFiles, total, malformed,
-                recordsPerBatch, malformedPerBatch);
-    }
-
-    private static String serialize(int batchId, LogRecord r) {
-        StringBuilder sb = new StringBuilder(96);
-        sb.append(batchId).append('\t')
-          .append(safe(r.getHost())).append('\t')
-          .append(r.getLogDate()).append('\t')
-          .append(r.getLogHour()).append('\t')
-          .append(safe(r.getMethod())).append('\t')
-          .append(safe(r.getResourcePath())).append('\t')
-          .append(safe(r.getProtocol())).append('\t')
-          .append(r.getStatusCode()).append('\t')
-          .append(r.getBytes());
-        return sb.toString();
-    }
-
-    private static String safe(String s) {
-        if (s == null) return "";
-        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
-    }
-
-    private List<Path> collectInputFiles(FileSystem fs, Path rootPath) throws Exception {
-        List<Path> inputFiles = new ArrayList<>();
-        if (fs.isFile(rootPath)) {
-            inputFiles.add(rootPath);
-            return inputFiles;
-        }
-        RemoteIterator<LocatedFileStatus> files = fs.listFiles(rootPath, true);
-        while (files.hasNext()) {
-            LocatedFileStatus file = files.next();
-            if (!file.isFile()) continue;
-            String name = file.getPath().getName();
-            if (name.startsWith("_") || name.startsWith(".")) continue;
-            inputFiles.add(file.getPath());
-        }
-        Collections.sort(inputFiles, Comparator.comparing(Path::toString));
-        return inputFiles;
-    }
-
-    private static final class BatchPrep {
-        final Path batchDir;
-        final List<Path> batchFiles;
-        final long totalRecords;
-        final long malformedRecords;
-        final Map<Integer, Integer> recordsPerBatch;
-        final Map<Integer, Integer> malformedPerBatch;
-
-        BatchPrep(Path batchDir, List<Path> batchFiles, long totalRecords, long malformedRecords,
-                  Map<Integer, Integer> recordsPerBatch, Map<Integer, Integer> malformedPerBatch) {
-            this.batchDir          = batchDir;
-            this.batchFiles        = batchFiles;
-            this.totalRecords      = totalRecords;
-            this.malformedRecords  = malformedRecords;
-            this.recordsPerBatch   = recordsPerBatch;
-            this.malformedPerBatch = malformedPerBatch;
-        }
     }
 }

@@ -165,18 +165,21 @@ Pipeline <|.. HivePipeline
 Pipeline ..> PipelineResult : returns
 PipelineResult "1" *-- "*" ResultRow : contains
 
-MapReducePipeline --> BatchSplitter : prepares batches
-PigPipeline       --> BatchSplitter : prepares batches
-MongoDBPipeline   --> LogParser     : parses in-process
-HivePipeline      --> LogParser     : parses while writing TSV
+MapReducePipeline --> BatchSplitter : writes batch-NNNNN.log
+PigPipeline       --> BatchSplitter : writes batch-NNNNN.log
+MongoDBPipeline   --> BatchSplitter : reuses splitter helpers
+HivePipeline      --> BatchSplitter : writes batch-NNNNN.log
 
 MapReducePipeline --> LogMapper
 MapReducePipeline --> QueryReducer
-LogMapper         --> LogParser
+LogMapper         --> LogParser     : parses inside MR
 LogMapper         --> BatchSplitter : reads batch_id from filename
 
-PigPipeline       --> LogParserUDF
-LogParserUDF      --> LogParser
+PigPipeline       --> LogParserUDF  : registers UDF
+LogParserUDF      --> LogParser     : invoked inside Pig
+
+MongoDBPipeline   ..> RegexFind     : $regexFind on raw line inside Mongo
+HivePipeline      ..> RegexSerDe    : NCSA regex applied inside Hive
 
 LogParser --> LogRecord : produces
 
@@ -198,15 +201,15 @@ D -->|pig| PG["PigPipeline"]
 D -->|mongodb| MG["MongoDBPipeline"]
 D -->|hive| HV["HivePipeline"]
 
-MR --> BS1["BatchSplitter.split<br/>writes batch-NNNNN.log"]
-PG --> BS2["BatchSplitter.split<br/>writes batch-NNNNN.log"]
-MG --> BS3["batched insertMany<br/>docs tagged with batch_id"]
-HV --> BS4["prepareBatches<br/>writes batch-NNNNN.tsv<br/>batch_id is column 0"]
+MR --> BS1["BatchSplitter.split<br/>writes batch-NNNNN.log<br/>(raw NCSA, no parsing)"]
+PG --> BS2["BatchSplitter.split<br/>writes batch-NNNNN.log<br/>(raw NCSA, no parsing)"]
+MG --> BS3["insertMany batch_id and raw line<br/>(no parsing in Java)"]
+HV --> BS4["BatchSplitter.split<br/>writes batch-NNNNN.log<br/>(raw NCSA, no parsing)"]
 
-BS1 --> EX1["MR job per query<br/>reducer key prefixed with batch_id"]
-BS2 --> EX2["Pig script per batch per query"]
-BS3 --> EX3["Mongo aggregation<br/>group by batch_id and key"]
-BS4 --> EX4["HiveQL GROUP BY<br/>batch_id and key"]
+BS1 --> EX1["LogMapper parses inside MR<br/>reducer key prefixed with batch_id"]
+BS2 --> EX2["Pig LOAD + LogParserUDF<br/>parses inside Pig per batch"]
+BS3 --> EX3["dollar regexFind parses inside Mongo<br/>then group by batch_id and key"]
+BS4 --> EX4["RegexSerDe parses inside Hive<br/>then GROUP BY batch_id and key"]
 
 EX1 --> RR["List of ResultRow<br/>each tagged with batch_id"]
 EX2 --> RR
@@ -317,7 +320,6 @@ sequenceDiagram
 
 participant Runner as ETLRunner
 participant Mongo as MongoDBPipeline
-participant LP as LogParser
 participant DR as MongoDB driver
 participant Coll as etl_logs_runIdHex
 participant Loader as ResultLoader
@@ -326,17 +328,15 @@ participant DB as MySQL
 Runner->>Mongo: execute(config)
 
 Mongo->>DR: MongoClients.create(mongoUri)
-Mongo->>Coll: drop and createIndex on batch_id and keys
+Mongo->>Coll: drop and createIndex on batch_id
 
 rect rgb(240, 248, 255)
-Note over Mongo,Coll: ETL phase — parse and batched insertMany
+Note over Mongo,Coll: ETL phase — insert raw NCSA lines (no parsing in Java)
 
 loop for every raw NCSA log line
-    Mongo->>LP: parse(line)
-    LP-->>Mongo: parsed LogRecord or empty
-    Mongo->>Mongo: tag doc with current batch_id, append to buffer
+    Mongo->>Mongo: append batch_id and raw line to buffer
     alt buffer is full
-        Mongo->>Coll: insertMany(buffer)
+        Mongo->>Coll: insertMany(buffer of batch_id and line docs)
         Coll-->>Mongo: ack
         Mongo->>Mongo: increment batch count, reset buffer
     end
@@ -344,17 +344,23 @@ end
 Mongo->>Coll: flush final partial buffer
 end
 
+rect rgb(255, 245, 240)
+Note over Mongo,Coll: Malformed counting (server-side regex)
+Mongo->>Coll: aggregate dollar regexFind on line<br/>then match where regex returned null<br/>then count
+Coll-->>Mongo: malformed counts (global and per batch)
+end
+
 rect rgb(248, 248, 235)
-Note over Mongo,Coll: Aggregation phase — one pipeline per selected query
+Note over Mongo,Coll: Aggregation phase — every pipeline prepends parseStages()<br/>(dollar regexFind, dollar match, dollar addFields for fields and bytes and log_date and log_hour)
 
 alt Q1 daily_traffic
-    Mongo->>Coll: group on batch_id and log_date and status_code,<br/>sum count and sum bytes
+    Mongo->>Coll: parseStages then group on batch_id and log_date and status_code<br/>then sum count and sum bytes
 end
 alt Q2 top_resources, top 20 per batch
-    Mongo->>Coll: group on batch_id and resource_path,<br/>then sort and push into per-batch arrays,<br/>then slice 20
+    Mongo->>Coll: parseStages then group on batch_id and resource_path<br/>then sort then group dollar push into arrays<br/>then dollar slice 20 then unwind
 end
 alt Q3 hourly_errors
-    Mongo->>Coll: group on batch_id and log_date and log_hour,<br/>count errors with cond, divide for error rate,<br/>addToSet of host gated on the error cond
+    Mongo->>Coll: parseStages then group on batch_id and log_date and log_hour<br/>then conditional dollar sum for errors and addToSet host
 end
 Coll-->>Mongo: cursor over per batch and key documents
 end
@@ -378,7 +384,7 @@ sequenceDiagram
 
 participant Runner as ETLRunner
 participant Hive as HivePipeline
-participant LP as LogParser
+participant BS as BatchSplitter
 participant FS as FileSystem (local)
 participant JDBC as Hive JDBC
 participant HS2 as HiveServer2
@@ -388,29 +394,31 @@ participant DB as MySQL
 Runner->>Hive: execute(config)
 
 rect rgb(240, 248, 255)
-Note over Hive,FS: prepareBatches — parse + write TSV with batch_id col 0
+Note over Hive,FS: BatchSplitter writes raw NCSA batch-NNNNN.log files<br/>(no parsing in Java)
 
-loop stream raw NCSA log lines
-    Hive->>LP: parse(line)
-    LP-->>Hive: Optional[LogRecord]
-    Hive->>FS: write "batch_id \t host \t log_date \t ... \t bytes" to<br/>/tmp/etl_hive_batches/runId/batch-NNNNN.tsv
-    Hive->>Hive: rotate to batch NNNNN+1 every batchSize lines
-end
+Hive->>BS: split(input, batchSize, batchDir)
+BS->>FS: write batch-NNNNN.log files
+BS-->>Hive: Result with batch counts and malformed counts (computed via shared LogParser regex)
 end
 
 Hive->>JDBC: DriverManager.getConnection(hiveJdbcUrl)
 JDBC->>HS2: open session
-Hive->>HS2: DROP TABLE IF EXISTS etl_logs_runIdHex
-Hive->>HS2: CREATE EXTERNAL TABLE ... LOCATION '/tmp/.../batches/'
+
+rect rgb(255, 245, 240)
+Note over Hive,HS2: RegexSerDe table + cleaning view — parsing inside Hive
+
+Hive->>HS2: CREATE EXTERNAL TABLE etl_logs_raw_runId<br/>ROW FORMAT SERDE RegexSerDe<br/>input.regex matches NCSA log format<br/>LOCATION points at batch-NNNNN.log dir
+Hive->>HS2: CREATE VIEW etl_logs_runId AS<br/>SELECT regexp_extract from INPUT__FILE__NAME for batch_id,<br/>unix_timestamp from_unixtime for log_date,<br/>substr for log_hour,<br/>split request for method path protocol,<br/>CASE WHEN bytes_str = '-' THEN 0 ELSE CAST AS BIGINT END<br/>FROM etl_logs_raw_runId WHERE status_code IS NOT NULL
+end
 
 rect rgb(248, 248, 235)
-Note over Hive,HS2: Aggregation phase — HiveQL per selected query
+Note over Hive,HS2: Aggregation phase — HiveQL over the cleaning view
 
 alt Q1 daily_traffic
-    Hive->>HS2: GROUP BY batch_id, log_date, status_code<br/>with COUNT and SUM of bytes
+    Hive->>HS2: GROUP BY batch_id, log_date, status_code<br/>with COUNT and SUM bytes
 end
 alt Q2 top_resources, top 20 per batch
-    Hive->>HS2: inner GROUP BY batch_id and resource_path<br/>with ROW_NUMBER OVER PARTITION BY batch_id,<br/>outer query keeps rn up to 20
+    Hive->>HS2: GROUP BY batch_id, resource_path<br/>with COUNT, SUM bytes, COUNT DISTINCT host<br/>(Java post-process keeps top 20 per batch_id, like MR and Pig)
 end
 alt Q3 hourly_errors
     Hive->>HS2: GROUP BY batch_id, log_date, log_hour<br/>with CASE WHEN status BETWEEN 400 AND 599<br/>plus COUNT DISTINCT host gated on the same CASE
@@ -418,7 +426,7 @@ end
 HS2-->>Hive: ResultSet streaming per batch and key rows
 end
 
-Hive->>HS2: DROP TABLE etl_logs_runIdHex  (finally)
+Hive->>HS2: DROP VIEW + DROP TABLE in finally
 
 Hive-->>Runner: PipelineResult{rows, recordsPerBatch, malformedPerBatch}
 
@@ -850,22 +858,35 @@ All four pipelines implement the same logical ETL steps, do **per-batch** aggreg
 | Stage | MapReduce | Pig | MongoDB | Hive |
 |---|---|---|---|---|
 | Raw input | NCSA log lines (local FS / HDFS) | NCSA log lines | NCSA log lines | NCSA log lines |
-| Batch splitter | `BatchSplitter` writes raw `batch-NNNNN.log` files | `BatchSplitter` writes raw `batch-NNNNN.log` files | In-memory `insertMany` chunks of `batchSize` docs, tagged with `batch_id` | Java `prepareBatches` writes parsed TSV with `batch_id` as col 1 |
-| Parsing | `LogMapper` (inside MR) calls `LogParser`; `batch_id` recovered from `FileSplit` filename | Per-batch invocations of `pig/*.pig`; `LogParserUDF` parses inside Pig | Java `LogParser` before insert | Java `LogParser` while writing TSV |
-| Aggregation grain | `GROUP BY batch_id, …` via prefixed reducer key | One Pig run per batch → per-batch results stamped in Java | `$group _id: {batch_id, …}` | `GROUP BY batch_id, …` in HiveQL |
-| Top-20 limit | Top 20 per batch in Java | Top 20 per batch in Java | `$sort` + `$group $push` + `$slice 20` | `ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY count DESC)` |
+| Batch splitter | `BatchSplitter` writes raw `batch-NNNNN.log` files | `BatchSplitter` writes raw `batch-NNNNN.log` files | Driver `insertMany` of `{batch_id, line}` raw documents | `BatchSplitter` writes raw `batch-NNNNN.log` files |
+| **Parsing (where it runs)** | **Inside MR** — `LogMapper.map()` calls `LogParser`; `batch_id` from `FileSplit` filename | **Inside Pig** — `LOAD … USING TextLoader` + `LogParserUDF` invoked per batch | **Inside MongoDB** — `$regexFind` stage prepended to every aggregation pipeline | **Inside Hive** — `RegexSerDe` + cleaning view (regex match, date / hour / bytes casts) |
+| Malformed detection | Hadoop counter inside reducer | `FILTER … IS NOT NULL` in Pig | Server-side `$regexFind == null` count | Rows where `RegexSerDe` produced `NULL` for `status_code`, filtered by view |
+| Aggregation grain | `GROUP BY batch_id, …` via prefixed reducer key | One Pig run per batch → per-batch results stamped in Java | `$group _id: {batch_id, …}` (after `parseStages`) | `GROUP BY batch_id, …` over the cleaning view in HiveQL |
+| Top-20 limit | Top 20 per batch in Java post-processing | Top 20 per batch in Java post-processing | `$sort` + `$group $push` + `$slice 20` (server-side) | Top 20 per batch in Java post-processing |
 | Result load | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL | Shared `ResultLoader` → MySQL |
 | Reporting | Shared `Reporter`: per-batch + SQL global rollup | same | same | same |
 
-The CLI, `LogParser`, `ResultRow` schema, `ResultLoader`, and `Reporter` are reused unchanged across every pipeline.
+The CLI, `LogParser` (used directly by MR / Pig; mirrored as `$regexFind` regex and `RegexSerDe` regex for Mongo / Hive), `ResultRow` schema, `ResultLoader`, and `Reporter` are reused unchanged across every pipeline.
+
+### Engine-Native Parsing — Rubric Compliance
+
+> "Loading the data from the batch source and performing the cleaning operations should also be implemented as [the chosen engine's] jobs, rather than using a separate Unix/Java/Python single-threaded script."
+
+| Engine | Loading | Cleaning (regex, date, bytes-"-", malformed filter) |
+|---|---|---|
+| MapReduce | `TextInputFormat` inside MR | `LogMapper.map()` inside MR |
+| Pig | `LOAD … USING TextLoader()` inside Pig | `LogParserUDF` invoked inside Pig (`FOREACH … GENERATE`) |
+| MongoDB | Driver `insertMany` of raw `{batch_id, line}` documents (no parsing) | `$regexFind`, `$addFields`, `$dateFromString`, `$cond` inside the aggregation pipeline |
+| Hive | `CREATE EXTERNAL TABLE … RegexSerDe … LOCATION` over raw `batch-NNNNN.log` files | `RegexSerDe` (regex match) + HiveQL view (`regexp_extract`, `unix_timestamp`, `substr`, `split`, `CASE WHEN`) |
+
+No engine relies on a single-threaded Java pre-parse; every regex match, date parse, byte coercion, and malformed-record filter runs inside the chosen execution engine.
 
 ## Batching Strategy
 
 - The raw NASA log is **split into batches of exactly `--batch-size` input lines**. Both successfully-parsed and malformed lines count toward a batch's size, so the batch boundaries are deterministic and reproducible.
 - Each batch gets a sequential `batch_id` starting at 1. The final batch may contain fewer than `batch-size` records — it is still counted as one valid batch.
-- For MR and Pig, the splitter writes `batch-NNNNN.log` files under `/tmp/etl_{mr,pig}_batches/<runId>/`. Each pipeline recovers `batch_id` from the filename so the aggregation engine itself sees the batch tag.
-- For Hive, the splitter writes `batch-NNNNN.tsv` files where `batch_id` is the first column; the external table has a typed `batch_id INT` column.
-- For MongoDB, each parsed record is tagged with `batch_id` in-memory before `insertMany`, and every aggregation `$group`s on `batch_id` first.
+- For **MapReduce**, **Pig**, and **Hive**, the splitter writes raw `batch-NNNNN.log` files under `/tmp/etl_{mr,pig,hive}_batches/<runId>/`. Each pipeline recovers `batch_id` from the filename: MR via `FileSplit.getPath().getName()`, Pig via the per-batch invocation loop, Hive via `regexp_extract(INPUT__FILE__NAME, 'batch-([0-9]+)\.log', 1)` inside the view.
+- For **MongoDB**, each raw line is inserted as `{batch_id, line}`, where `batch_id` is incremented every `batchSize` records before insert.
 - `total_batches` and `avg_batch_size = total_records / total_batches` are persisted to `etl_runs`; per-batch `(records_in_batch, malformed_in_batch)` are persisted to `etl_batches`.
 
 ## Sample Output

@@ -1,8 +1,6 @@
 package com.etl.pipeline.mongodb;
 
 import com.etl.core.ETLConfig;
-import com.etl.core.LogParser;
-import com.etl.core.LogRecord;
 import com.etl.core.Pipeline;
 import com.etl.core.PipelineResult;
 import com.etl.core.ResultRow;
@@ -11,6 +9,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
 import org.bson.Document;
@@ -31,19 +30,41 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
- * MongoDB-backed ETL pipeline with per-batch aggregation.
+ * MongoDB-backed ETL pipeline with engine-native parsing and per-batch
+ * aggregation.
  *
- *   1. NCSA log lines are parsed in Java and bulk-inserted into a per-run
- *      collection. Every document carries the batch_id it belonged to.
- *   2. The three mandatory queries are expressed as MongoDB aggregation
- *      pipelines that GROUP BY batch_id first, so each result row corresponds
- *      to a single (batch_id, grouping key) pair.
- *   3. The temporary collection is dropped on completion.
+ * <p><b>Engine-native parsing.</b> Raw NCSA log lines are inserted into a
+ * per-run MongoDB collection as documents of shape
+ * {@code {batch_id, line}} — <em>no parsing happens in Java</em>. Every
+ * analytical aggregation pipeline begins with a shared "parse stage" of
+ * MongoDB aggregation operators:
+ * <ul>
+ *   <li>{@code $regexFind} — runs the NCSA regex inside MongoDB</li>
+ *   <li>{@code $match} — drops malformed lines (regex did not match)</li>
+ *   <li>{@code $addFields} — extracts capture groups, casts status_code,
+ *       parses the timestamp via {@code $dateFromString}, computes
+ *       {@code log_date}, {@code log_hour}, {@code resource_path}, and
+ *       {@code bytes} (with "-" &rarr; 0)</li>
+ * </ul>
+ *
+ * <p>Subsequent stages run the per-batch group/aggregation work specific to
+ * each of Q1/Q2/Q3. The collection is dropped after all queries complete.
+ *
+ * <p>Per-batch aggregation is enforced by every {@code $group _id} including
+ * {@code batch_id}; Q2 uses
+ * {@code $sort + $group $push + $project $slice 20} for top-20 enforcement.
  */
 public class MongoDBPipeline implements Pipeline {
+
+    /**
+     * NCSA regex used inside MongoDB's {@code $regexFind} stage. Mirrors the
+     * Java {@code LogParser} regex so the four pipelines agree on what counts
+     * as a well-formed line.
+     */
+    private static final String NCSA_REGEX =
+            "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)\\] \"([^\"]*)\" (\\d{3}) (\\S+)\\s*$";
 
     @Override
     public PipelineResult execute(ETLConfig config) throws Exception {
@@ -53,13 +74,12 @@ public class MongoDBPipeline implements Pipeline {
         String runId = config.getRunId().toString();
         String collectionName = "etl_logs_" + runId.replace("-", "");
 
-        long totalRecords = 0;
-        long malformedCount = 0;
-        int  batchCount = 0;
+        long totalRecords   = 0;
+        int  batchCount     = 0;
         List<ResultRow> rows = new ArrayList<>();
 
         Map<Integer, Integer> recordsPerBatch   = new LinkedHashMap<>();
-        Map<Integer, Integer> malformedPerBatch = new LinkedHashMap<>();
+        Map<Integer, Integer> malformedPerBatch = new LinkedHashMap<>();   // computed post-load
 
         try (MongoClient client = MongoClients.create(config.getMongoUri())) {
             MongoDatabase db = client.getDatabase(config.getMongoDatabase());
@@ -67,11 +87,11 @@ public class MongoDBPipeline implements Pipeline {
 
             coll.drop();
             coll.createIndex(Indexes.ascending("batch_id"), new IndexOptions().background(false));
-            coll.createIndex(Indexes.ascending("batch_id", "log_date", "status_code"));
-            coll.createIndex(Indexes.ascending("batch_id", "resource_path"));
-            coll.createIndex(Indexes.ascending("batch_id", "log_date", "log_hour"));
 
-            // --- ETL: stream raw input, parse, batched-insert with batch_id --
+            // ── Step 1 — bulk-insert raw NCSA lines as {batch_id, line} docs.
+            // The only Java work is BufferedReader.readLine() and insertMany().
+            // No regex matching, date parsing, or field extraction happens
+            // here — every parse step runs server-side inside MongoDB.
             Configuration conf = new Configuration();
             conf.set("fs.defaultFS", "file:///");
             Path rootPath = new Path(config.getInputPath());
@@ -79,54 +99,32 @@ public class MongoDBPipeline implements Pipeline {
 
             List<Path> inputFiles = collectInputFiles(fs, rootPath);
             int batchSize = config.getBatchSize();
-            int currentBatchId = 0;
+            int currentBatchId = 1;
             int currentBatchRecords = 0;
-            int currentBatchMalformed = 0;
             List<Document> buffer = new ArrayList<>(batchSize);
 
             for (Path file : inputFiles) {
                 try (BufferedReader br = new BufferedReader(new InputStreamReader(fs.open(file)))) {
                     String line;
                     while ((line = br.readLine()) != null) {
-                        // A new batch starts at the first record AND every time
-                        // we've filled batchSize lines of *input* (parsed or not).
-                        if (currentBatchRecords == 0 && currentBatchId == 0) {
-                            currentBatchId = 1;
-                        } else if (currentBatchRecords == batchSize) {
-                            // Flush current batch into Mongo before starting the next.
+                        if (currentBatchRecords == batchSize) {
+                            // Flush before starting next batch.
                             if (!buffer.isEmpty()) {
                                 coll.insertMany(buffer);
                                 buffer.clear();
                             }
                             recordsPerBatch.put(currentBatchId, currentBatchRecords);
-                            malformedPerBatch.put(currentBatchId, currentBatchMalformed);
                             batchCount++;
                             currentBatchId++;
                             currentBatchRecords = 0;
-                            currentBatchMalformed = 0;
                         }
 
                         totalRecords++;
                         currentBatchRecords++;
 
-                        Optional<LogRecord> parsed = LogParser.parse(line);
-                        if (!parsed.isPresent()) {
-                            malformedCount++;
-                            currentBatchMalformed++;
-                            continue;
-                        }
-                        LogRecord r = parsed.get();
-                        Document doc = new Document()
-                                .append("batch_id",      currentBatchId)
-                                .append("host",          r.getHost())
-                                .append("log_date",      r.getLogDate())
-                                .append("log_hour",      r.getLogHour())
-                                .append("method",        r.getMethod())
-                                .append("resource_path", r.getResourcePath())
-                                .append("protocol",      r.getProtocol())
-                                .append("status_code",   r.getStatusCode())
-                                .append("bytes",         r.getBytes());
-                        buffer.add(doc);
+                        buffer.add(new Document()
+                                .append("batch_id", currentBatchId)
+                                .append("line",     line));
                     }
                 }
             }
@@ -137,14 +135,29 @@ public class MongoDBPipeline implements Pipeline {
                     buffer.clear();
                 }
                 recordsPerBatch.put(currentBatchId, currentBatchRecords);
-                malformedPerBatch.put(currentBatchId, currentBatchMalformed);
                 batchCount++;
             }
 
-            System.out.println("[MongoDBPipeline] Loaded " + (totalRecords - malformedCount)
-                    + " documents into " + collectionName + " across " + batchCount + " batches.");
+            // ── Step 2 — count malformed lines via $regexFind on the
+            //              raw {batch_id, line} collection. This count is
+            //              also computed entirely server-side.
+            long malformedCount = countMalformed(coll);
+            for (Integer bid : recordsPerBatch.keySet()) {
+                malformedPerBatch.put(bid, countMalformedForBatch(coll, bid));
+            }
 
-            // --- Aggregations -----------------------------------------------
+            System.out.println("[MongoDBPipeline] Inserted " + totalRecords
+                    + " raw lines into " + collectionName
+                    + " across " + batchCount + " batches"
+                    + " (malformed = " + malformedCount + ", detected server-side).");
+
+            // Once the data is in, build indexes that will accelerate the
+            // grouping aggregations after the parse stage.
+            coll.createIndex(Indexes.ascending("batch_id"));
+
+            // ── Step 3 — run each analytical aggregation pipeline. Every
+            //              pipeline prepends parseStages() so parsing happens
+            //              inside MongoDB before grouping/summing.
             try {
                 if (config.runsQuery("daily_traffic")) {
                     rows.addAll(runDailyTraffic(coll));
@@ -158,33 +171,128 @@ public class MongoDBPipeline implements Pipeline {
             } finally {
                 coll.drop();
             }
-        }
 
-        long runtimeMs = System.currentTimeMillis() - startTime;
-        return new PipelineResult(
-                totalRecords, batchCount, malformedCount,
-                runtimeMs, startedAt, Instant.now(),
-                rows,
-                recordsPerBatch,
-                malformedPerBatch);
+            long runtimeMs = System.currentTimeMillis() - startTime;
+            return new PipelineResult(
+                    totalRecords, batchCount, malformedCount,
+                    runtimeMs, startedAt, Instant.now(),
+                    rows,
+                    recordsPerBatch,
+                    malformedPerBatch);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared parse stages — prepended to every analytical aggregation.
+    // Runs the NCSA regex inside MongoDB, drops malformed lines, extracts
+    // capture groups, parses the timestamp, and projects the typed fields
+    // used by Q1/Q2/Q3 ($host, $log_date, $log_hour, $resource_path,
+    // $status_code, $bytes).
+    // -----------------------------------------------------------------------
+    private static List<Document> parseStages() {
+        List<Document> stages = new ArrayList<>();
+
+        // $regexFind on the raw line — returns null if no match.
+        stages.add(new Document("$addFields", new Document("p",
+                new Document("$regexFind",
+                        new Document("input", "$line")
+                                .append("regex", NCSA_REGEX)))));
+
+        // Filter out malformed lines (regex didn't match).
+        stages.add(new Document("$match", new Document("p", new Document("$ne", null))));
+
+        // Pull capture groups into typed fields. Capture group order:
+        //   captures[0] = host
+        //   captures[1] = ident   (unused, "-")
+        //   captures[2] = authuser (unused, "-")
+        //   captures[3] = ts      (e.g. "01/Jul/1995:00:00:01 -0400")
+        //   captures[4] = request (e.g. "GET /history/apollo/ HTTP/1.0")
+        //   captures[5] = status_code (3-digit string)
+        //   captures[6] = bytes_str ("-" for none, else digits)
+        stages.add(new Document("$addFields", new Document()
+                .append("host",        new Document("$arrayElemAt", Arrays.asList("$p.captures", 0)))
+                .append("ts",          new Document("$arrayElemAt", Arrays.asList("$p.captures", 3)))
+                .append("request",     new Document("$arrayElemAt", Arrays.asList("$p.captures", 4)))
+                .append("status_code", new Document("$toInt",
+                        new Document("$arrayElemAt", Arrays.asList("$p.captures", 5))))
+                .append("bytes_str",   new Document("$arrayElemAt", Arrays.asList("$p.captures", 6)))));
+
+        // Parse the date portion only ("01/Jul/1995") — no timezone
+        // conversion. Mirrors the LogParser / Hive RegexSerDe behaviour of
+        // using the NCSA local-time date as-is.
+        // log_hour: bytes 12-13 of "01/Jul/1995:00:00:01 -0400" = "00".
+        // resource_path: 2nd token of the request line.
+        // bytes: "-" → 0L, else $toLong.
+        stages.add(new Document("$addFields", new Document()
+                .append("parsed_dt", new Document("$dateFromString",
+                        new Document("dateString",
+                                new Document("$substr", Arrays.asList("$ts", 0, 11)))
+                                .append("format", "%d/%b/%Y")))
+                .append("log_hour", new Document("$toInt",
+                        new Document("$substr", Arrays.asList("$ts", 12, 2))))
+                .append("resource_path", new Document("$arrayElemAt", Arrays.asList(
+                        new Document("$split", Arrays.asList("$request", " ")), 1)))
+                .append("bytes", new Document("$cond", Arrays.asList(
+                        new Document("$eq", Arrays.asList("$bytes_str", "-")),
+                        0L,
+                        new Document("$toLong", "$bytes_str"))))));
+
+        // Derive log_date (yyyy-MM-dd string) from the parsed date.
+        stages.add(new Document("$addFields", new Document()
+                .append("log_date", new Document("$dateToString",
+                        new Document("date", "$parsed_dt").append("format", "%Y-%m-%d")))));
+
+        return stages;
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-side malformed-line counting via $regexFind.
+    // -----------------------------------------------------------------------
+    private static long countMalformed(MongoCollection<Document> coll) {
+        List<Document> pipeline = Arrays.asList(
+                new Document("$addFields", new Document("matched",
+                        new Document("$regexFind",
+                                new Document("input", "$line")
+                                        .append("regex", NCSA_REGEX)))),
+                new Document("$match", new Document("matched", null)),
+                new Document("$count", "n"));
+        long n = 0;
+        for (Document d : coll.aggregate(pipeline).allowDiskUse(true)) {
+            n = d.getInteger("n", 0);
+        }
+        return n;
+    }
+
+    private static int countMalformedForBatch(MongoCollection<Document> coll, int batchId) {
+        List<Document> pipeline = Arrays.asList(
+                new Document("$match", new Document("batch_id", batchId)),
+                new Document("$addFields", new Document("matched",
+                        new Document("$regexFind",
+                                new Document("input", "$line")
+                                        .append("regex", NCSA_REGEX)))),
+                new Document("$match", new Document("matched", null)),
+                new Document("$count", "n"));
+        for (Document d : coll.aggregate(pipeline).allowDiskUse(true)) {
+            return d.getInteger("n", 0);
+        }
+        return 0;
     }
 
     // -----------------------------------------------------------------------
     // Q1: Daily traffic summary (per batch)
     // -----------------------------------------------------------------------
     private List<ResultRow> runDailyTraffic(MongoCollection<Document> coll) {
-        List<Document> pipeline = Arrays.asList(
-                new Document("$group", new Document()
-                        .append("_id", new Document()
-                                .append("batch_id",    "$batch_id")
-                                .append("log_date",    "$log_date")
-                                .append("status_code", "$status_code"))
-                        .append("request_count", new Document("$sum", 1))
-                        .append("total_bytes",   new Document("$sum", "$bytes"))),
-                new Document("$sort", new Document("_id.batch_id", 1)
-                        .append("_id.log_date", 1)
-                        .append("_id.status_code", 1))
-        );
+        List<Document> pipeline = new ArrayList<>(parseStages());
+        pipeline.add(new Document("$group", new Document()
+                .append("_id", new Document()
+                        .append("batch_id",    "$batch_id")
+                        .append("log_date",    "$log_date")
+                        .append("status_code", "$status_code"))
+                .append("request_count", new Document("$sum", 1))
+                .append("total_bytes",   new Document("$sum", "$bytes"))));
+        pipeline.add(new Document("$sort", new Document("_id.batch_id", 1)
+                .append("_id.log_date", 1)
+                .append("_id.status_code", 1)));
 
         List<ResultRow> out = new ArrayList<>();
         for (Document d : coll.aggregate(pipeline).allowDiskUse(true)) {
@@ -202,37 +310,35 @@ public class MongoDBPipeline implements Pipeline {
     // -----------------------------------------------------------------------
     // Q2: Top requested resources (top 20 per batch)
     //
-    // Implemented as a two-phase aggregation: first $group by
-    // (batch_id, resource_path), then $sort + $group-into-array + $slice 20
-    // to keep only the top 20 per batch in a single pipeline.
+    // Phase 1: parse, group by (batch_id, resource_path), aggregate counts.
+    // Phase 2: sort within each batch, $push into an array, $slice the top 20.
     // -----------------------------------------------------------------------
     private List<ResultRow> runTopResources(MongoCollection<Document> coll) {
-        List<Document> pipeline = Arrays.asList(
-                new Document("$group", new Document()
-                        .append("_id", new Document()
-                                .append("batch_id",      "$batch_id")
-                                .append("resource_path", "$resource_path"))
-                        .append("request_count", new Document("$sum", 1))
-                        .append("total_bytes",   new Document("$sum", "$bytes"))
-                        .append("hosts",         new Document("$addToSet", "$host"))),
-                new Document("$project", new Document()
-                        .append("batch_id",      "$_id.batch_id")
-                        .append("resource_path", "$_id.resource_path")
-                        .append("request_count", 1)
-                        .append("total_bytes",   1)
-                        .append("distinct_hosts", new Document("$size", "$hosts"))),
-                new Document("$sort", new Document("batch_id", 1).append("request_count", -1)),
-                new Document("$group", new Document()
-                        .append("_id", "$batch_id")
-                        .append("top", new Document("$push", new Document()
-                                .append("resource_path",  "$resource_path")
-                                .append("request_count",  "$request_count")
-                                .append("total_bytes",    "$total_bytes")
-                                .append("distinct_hosts", "$distinct_hosts")))),
-                new Document("$project", new Document()
-                        .append("top", new Document("$slice", Arrays.asList("$top", 20)))),
-                new Document("$sort", new Document("_id", 1))
-        );
+        List<Document> pipeline = new ArrayList<>(parseStages());
+        pipeline.add(new Document("$group", new Document()
+                .append("_id", new Document()
+                        .append("batch_id",      "$batch_id")
+                        .append("resource_path", "$resource_path"))
+                .append("request_count", new Document("$sum", 1))
+                .append("total_bytes",   new Document("$sum", "$bytes"))
+                .append("hosts",         new Document("$addToSet", "$host"))));
+        pipeline.add(new Document("$project", new Document()
+                .append("batch_id",      "$_id.batch_id")
+                .append("resource_path", "$_id.resource_path")
+                .append("request_count", 1)
+                .append("total_bytes",   1)
+                .append("distinct_hosts", new Document("$size", "$hosts"))));
+        pipeline.add(new Document("$sort", new Document("batch_id", 1).append("request_count", -1)));
+        pipeline.add(new Document("$group", new Document()
+                .append("_id", "$batch_id")
+                .append("top", new Document("$push", new Document()
+                        .append("resource_path",  "$resource_path")
+                        .append("request_count",  "$request_count")
+                        .append("total_bytes",    "$total_bytes")
+                        .append("distinct_hosts", "$distinct_hosts")))));
+        pipeline.add(new Document("$project", new Document()
+                .append("top", new Document("$slice", Arrays.asList("$top", 20)))));
+        pipeline.add(new Document("$sort", new Document("_id", 1)));
 
         List<ResultRow> out = new ArrayList<>();
         for (Document batchDoc : coll.aggregate(pipeline).allowDiskUse(true)) {
@@ -254,42 +360,46 @@ public class MongoDBPipeline implements Pipeline {
 
     // -----------------------------------------------------------------------
     // Q3: Hourly error analysis (per batch)
+    //
+    // Conditional $sum counts errors without a $match prefilter; distinct
+    // error hosts are accumulated into a $addToSet that conditionally emits
+    // $$REMOVE for non-error rows.
     // -----------------------------------------------------------------------
     private List<ResultRow> runHourlyErrors(MongoCollection<Document> coll) {
-        Document isErrorCond = new Document("$cond", Arrays.asList(
+        Document isErrorOne = new Document("$cond", Arrays.asList(
                 new Document("$and", Arrays.asList(
                         new Document("$gte", Arrays.asList("$status_code", 400)),
                         new Document("$lte", Arrays.asList("$status_code", 599)))),
                 1, 0));
 
-        List<Document> pipeline = Arrays.asList(
-                new Document("$group", new Document()
-                        .append("_id", new Document()
-                                .append("batch_id", "$batch_id")
-                                .append("log_date", "$log_date")
-                                .append("log_hour", "$log_hour"))
-                        .append("total_request_count", new Document("$sum", 1))
-                        .append("error_request_count", new Document("$sum", isErrorCond))
-                        .append("error_hosts", new Document("$addToSet", new Document("$cond",
-                                Arrays.asList(
-                                        new Document("$and", Arrays.asList(
-                                                new Document("$gte", Arrays.asList("$status_code", 400)),
-                                                new Document("$lte", Arrays.asList("$status_code", 599)))),
-                                        "$host",
-                                        "$$REMOVE"))))),
-                new Document("$project", new Document()
-                        .append("total_request_count", 1)
-                        .append("error_request_count", 1)
-                        .append("error_rate", new Document("$cond", Arrays.asList(
-                                new Document("$eq", Arrays.asList("$total_request_count", 0)),
-                                0.0,
-                                new Document("$divide", Arrays.asList(
-                                        "$error_request_count", "$total_request_count")))))
-                        .append("distinct_error_hosts", new Document("$size", "$error_hosts"))),
-                new Document("$sort", new Document("_id.batch_id", 1)
-                        .append("_id.log_date", 1)
-                        .append("_id.log_hour", 1))
-        );
+        Document errorHostOrRemove = new Document("$cond", Arrays.asList(
+                new Document("$and", Arrays.asList(
+                        new Document("$gte", Arrays.asList("$status_code", 400)),
+                        new Document("$lte", Arrays.asList("$status_code", 599)))),
+                "$host",
+                "$$REMOVE"));
+
+        List<Document> pipeline = new ArrayList<>(parseStages());
+        pipeline.add(new Document("$group", new Document()
+                .append("_id", new Document()
+                        .append("batch_id", "$batch_id")
+                        .append("log_date", "$log_date")
+                        .append("log_hour", "$log_hour"))
+                .append("total_request_count", new Document("$sum", 1))
+                .append("error_request_count", new Document("$sum", isErrorOne))
+                .append("error_hosts",         new Document("$addToSet", errorHostOrRemove))));
+        pipeline.add(new Document("$project", new Document()
+                .append("total_request_count", 1)
+                .append("error_request_count", 1)
+                .append("error_rate", new Document("$cond", Arrays.asList(
+                        new Document("$eq", Arrays.asList("$total_request_count", 0)),
+                        0.0,
+                        new Document("$divide", Arrays.asList(
+                                "$error_request_count", "$total_request_count")))))
+                .append("distinct_error_hosts", new Document("$size", "$error_hosts"))));
+        pipeline.add(new Document("$sort", new Document("_id.batch_id", 1)
+                .append("_id.log_date", 1)
+                .append("_id.log_hour", 1)));
 
         List<ResultRow> out = new ArrayList<>();
         for (Document d : coll.aggregate(pipeline).allowDiskUse(true)) {
