@@ -6,6 +6,8 @@ The user picks the execution backend, the query (`q1`, `q2`, `q3`, or `all`), an
 
 **Batching model.** Every pipeline produces *per-batch* aggregates: the raw input is split into batches of `batchSize` log lines, each batch is aggregated independently in the backend's own engine, and one result row is emitted per `(batch_id, group-by key)`. The reporter then computes a rolled-up global view in SQL on top of the per-batch rows.
 
+### Video Demo: https://www.youtube.com/watch?v=is4sVV4rDA8
+
 ---
 
 ## Architecture
